@@ -1127,7 +1127,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "Привет! Упомяните меня через @, начните сообщение с ?? или отправьте "
         "сообщение на английском языке — и я отвечу. Для анализа фото добавьте "
-        "подпись ?? ваш вопрос. Для напоминания используйте /н 18:30 текст."
+        "подпись ?? ваш вопрос. Для напоминания используйте /н. Подробнее: /help"
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "Возможности бота:\n"
+        "@бот текст — обычный ответ в чате.\n"
+        "?? текст — обычный режим без упоминания.\n"
+        "Английский текст без обращения — проверка и исправление английского.\n"
+        "Фото с подписью ?? вопрос или /analyze вопрос — анализ изображения.\n"
+        "/н свободное описание времени и задачи — напоминание. Например: "
+        "/н напомни завтра вечером купить продукты.\n"
+        "/start — краткое описание.\n"
+        "/help — эта справка.\n\n"
+        "Память и напоминания сохраняются локально в файлах приложения."
     )
 
 
@@ -1267,6 +1282,7 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["reminder_store"] = ReminderStore(settings.reminders_file)
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(r"^\s*/н(?:@[A-Za-z0-9_]+)?(?:\s+.*)?$"),
