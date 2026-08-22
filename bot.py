@@ -1315,7 +1315,11 @@ def main() -> None:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
     LOGGER.info("Starting Telegram bot")
-    build_application(settings).run_polling(allowed_updates=Update.ALL_TYPES)
+    # Keep retrying while the network/VPN is coming up during Windows startup.
+    build_application(settings).run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        bootstrap_retries=-1,
+    )
 
 
 if __name__ == "__main__":
