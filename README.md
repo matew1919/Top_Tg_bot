@@ -38,6 +38,10 @@ Copy-Item .env.example .env
 .\.venv\Scripts\python.exe bot.py
 ```
 
+На Windows автозапуск выполняется через `run_bot.vbs`. В рабочей конфигурации
+бот зарегистрирован в Планировщике заданий под именем `Top Tg Bot` и запускается
+при входе пользователя в систему.
+
 В `.env` укажите:
 
 1. `TELEGRAM_BOT_TOKEN` — токен от `@BotFather`.
