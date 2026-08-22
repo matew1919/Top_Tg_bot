@@ -30,9 +30,18 @@ try {
     }
 
     $pattern = $tun.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
+    $adapter = Get-NetAdapter -Name 'happ-tun' -ErrorAction SilentlyContinue
+    $tunnelIsUp = $adapter -and $adapter.Status -eq 'Up'
+
     if ($pattern.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::Off) {
         $pattern.Toggle()
         Write-Log 'HAPP TUN switch enabled'
+    } elseif (-not $tunnelIsUp) {
+        Write-Log 'HAPP TUN switch was on but tunnel was down; reconnecting'
+        $pattern.Toggle()
+        Start-Sleep -Seconds 2
+        $pattern.Toggle()
+        Write-Log 'HAPP TUN switch re-enabled'
     } else {
         Write-Log 'HAPP TUN switch was already enabled'
     }
