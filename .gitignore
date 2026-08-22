@@ -5,6 +5,7 @@
 memory.json
 reminders.json
 bot_autostart.log
+happ_autostart.log
 __pycache__/
 *.py[cod]
 .pytest_cache/
