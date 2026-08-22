@@ -15,10 +15,17 @@ import logging
 import os
 import re
 import asyncio
+import json
+from base64 import b64encode
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone as dt_timezone
+from pathlib import Path
+from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from gigachat import GigaChat
+from openai import OpenAI
 from telegram import Message, Update
 from telegram.ext import (
     Application,
@@ -36,6 +43,7 @@ LOGGER = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class Settings:
     telegram_token: str
+    ai_provider: str
     gigachat_credentials: str | None
     gigachat_scope: str
     gigachat_model: str
@@ -43,10 +51,27 @@ class Settings:
     gigachat_verify_ssl: bool
     gigachat_timeout: float
     gigachat_max_retries: int
+    vsegpt_api_key: str | None
+    vsegpt_model: str
+    vsegpt_base_url: str
+    vsegpt_max_tokens: int
+    vsegpt_vision_model: str
+    vision_prompt: str
     telegram_timeout: float
     system_prompt: str
     english_coach_prompt: str
-    max_history_messages: int
+    soft_context_limit: int
+    hard_context_limit: int
+    keep_last_messages: int
+    memory_file: str
+    memory_max_tokens: int
+    memory_prompt: str
+    max_english_history_messages: int
+    reminders_file: str
+    reminder_schedule_prompt: str
+    reminder_prompt: str
+    timezone: str
+    reminder_poll_seconds: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -54,8 +79,14 @@ class Settings:
         if not token:
             raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
 
+        provider = os.getenv("AI_PROVIDER", "gigachat").strip().lower()
+        if provider not in {"gigachat", "vsegpt"}:
+            raise RuntimeError("AI_PROVIDER must be either 'gigachat' or 'vsegpt'")
+        vsegpt_api_key = os.getenv("VSEGPT_API_KEY", "").strip() or None
+
         return cls(
             telegram_token=token,
+            ai_provider=provider,
             # OPENAI_* fallbacks keep compatibility with the first .env file,
             # where the GigaChat authorization key was entered under that name.
             gigachat_credentials=(
@@ -72,6 +103,17 @@ class Settings:
             gigachat_verify_ssl=os.getenv("GIGACHAT_VERIFY_SSL_CERTS", "false").lower() == "true",
             gigachat_timeout=float(os.getenv("GIGACHAT_TIMEOUT", "60")),
             gigachat_max_retries=max(0, int(os.getenv("GIGACHAT_MAX_RETRIES", "3"))),
+            vsegpt_api_key=vsegpt_api_key,
+            vsegpt_model=os.getenv("VSEGPT_MODEL", "openai/gpt-4o-mini").strip(),
+            vsegpt_base_url=os.getenv("VSEGPT_BASE_URL", "https://api.vsegpt.ru/v1").strip(),
+            vsegpt_max_tokens=max(32, int(os.getenv("VSEGPT_MAX_TOKENS", "200"))),
+            vsegpt_vision_model=os.getenv(
+                "VSEGPT_VISION_MODEL", "vis-google/gemini-3-flash-pre"
+            ).strip(),
+            vision_prompt=os.getenv(
+                "VISION_PROMPT",
+                "Reply briefly in Russian like in a messenger. Do not use Markdown.",
+            ).strip(),
             telegram_timeout=float(os.getenv("TELEGRAM_TIMEOUT", "30")),
             system_prompt=os.getenv(
                 "SYSTEM_PROMPT",
@@ -89,7 +131,41 @@ class Settings:
                 "совета. Не пиши приветствия, похвалу или лишние объяснения. "
                 "Примеры оставляй на английском.",
             ).strip(),
-            max_history_messages=max(1, int(os.getenv("MAX_HISTORY_MESSAGES", "8"))),
+            soft_context_limit=max(2, int(os.getenv("SOFT_CONTEXT_LIMIT", "8"))),
+            hard_context_limit=max(3, int(os.getenv("HARD_CONTEXT_LIMIT", "20"))),
+            keep_last_messages=max(1, int(os.getenv("KEEP_LAST_MESSAGES", "2"))),
+            memory_file=os.getenv("MEMORY_FILE", "memory.json").strip() or "memory.json",
+            memory_max_tokens=max(64, int(os.getenv("MEMORY_MAX_TOKENS", "150"))),
+            memory_prompt=os.getenv(
+                "MEMORY_PROMPT",
+                "Extract only durable important facts from the transcript. "
+                "Return plain text only, never JSON or Markdown. Use one line per fact: "
+                "CHAT_FACT: fact or USER_FACT: user_id|name|fact. "
+                "If there are no durable facts, return EMPTY.",
+            ).strip(),
+            max_english_history_messages=max(
+                1, int(os.getenv("MAX_ENGLISH_HISTORY_MESSAGES", "1"))
+            ),
+            reminders_file=os.getenv("REMINDERS_FILE", "reminders.json").strip()
+            or "reminders.json",
+            reminder_schedule_prompt=os.getenv(
+                "REMINDER_SCHEDULE_PROMPT",
+                "Определи время напоминания из сообщения пользователя. "
+                "Учитывай текущее время и часовой пояс. Верни только две строки: "
+                "TIME: YYYY-MM-DD HH:MM и TEXT: краткий смысл напоминания. "
+                "Если время определить нельзя, верни TIME: NONE. Если пользователь "
+                "явно указал прошедшую дату или время, оставь его прошедшим: бот "
+                "должен выполнить такую задачу сразу. Для времени без даты выбирай "
+                "следующее наступление.",
+            ).strip(),
+            reminder_prompt=os.getenv(
+                "REMINDER_PROMPT",
+                "Пойми смысл исходного текста напоминания и сформулируй его естественно. "
+                "Напиши одну короткую фразу на русском. Не используй шаблон, не добавляй "
+                "новые факты, время, приветствие или Markdown. Верни только текст напоминания.",
+            ).strip(),
+            timezone=os.getenv("BOT_TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow",
+            reminder_poll_seconds=max(5, int(os.getenv("REMINDER_POLL_SECONDS", "15"))),
         )
 
 
@@ -150,10 +226,411 @@ def contains_excluded_mention(text: str) -> bool:
     return bool(re.search(r"(?<!\w)@(?:pic|gif)(?!\w)", text, re.I))
 
 
+def project_path(filename: str) -> Path:
+    configured_path = Path(filename)
+    return (
+        configured_path
+        if configured_path.is_absolute()
+        else Path(__file__).resolve().parent / configured_path
+    )
+
+
+def timezone_now(timezone_name: str) -> datetime:
+    try:
+        timezone = ZoneInfo(timezone_name)
+    except Exception:
+        LOGGER.warning("Timezone data unavailable for %s; using fixed Europe/Moscow UTC+3", timezone_name)
+        timezone = dt_timezone(timedelta(hours=3), name="MSK")
+    return datetime.now(timezone)
+
+
+class MemoryStore:
+    """Small local JSON store for chat-wide and per-user facts."""
+
+    def __init__(self, filename: str) -> None:
+        # Keep a relative MEMORY_FILE next to bot.py, regardless of the
+        # working directory selected by PyCharm or a terminal.
+        self.path = project_path(filename)
+        self.data: dict[str, object] = {"version": 1, "chats": {}, "users": {}}
+        LOGGER.info("Memory file: %s", self.path)
+        self._load()
+        if not self.path.exists():
+            self._save()
+
+    def _load(self) -> None:
+        try:
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                self.data.update(loaded)
+                self._normalize()
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError):
+            LOGGER.warning("Could not load memory file %s; starting empty", self.path)
+
+    @classmethod
+    def _normalize_scope(cls, scope: dict[str, object]) -> None:
+        """Add immutable/mutable buckets and migrate the old flat facts list."""
+
+        immutable = scope.setdefault("immutable", {})
+        mutable = scope.setdefault("mutable", {})
+        if not isinstance(immutable, dict):
+            scope["immutable"] = immutable = {}
+        if not isinstance(mutable, dict):
+            scope["mutable"] = mutable = {}
+        if not isinstance(immutable.get("facts"), list):
+            immutable["facts"] = []
+        if not isinstance(mutable.get("facts"), list):
+            mutable["facts"] = []
+
+        # Facts written by the previous version were model-managed, so they
+        # belong in mutable rather than becoming protected facts.
+        legacy_facts = scope.pop("facts", None)
+        if isinstance(legacy_facts, list):
+            cls._add_facts(mutable, legacy_facts)
+
+    def _normalize(self) -> None:
+        self.data["version"] = 1
+        chats = self.data.setdefault("chats", {})
+        users = self.data.setdefault("users", {})
+        if not isinstance(chats, dict):
+            self.data["chats"] = chats = {}
+        if not isinstance(users, dict):
+            self.data["users"] = users = {}
+        for chat in chats.values():
+            if isinstance(chat, dict):
+                self._normalize_scope(chat)
+        for chat_users in users.values():
+            if not isinstance(chat_users, dict):
+                continue
+            for user in chat_users.values():
+                if isinstance(user, dict):
+                    self._normalize_scope(user)
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    @staticmethod
+    def _add_facts(target: dict[str, object], facts: object, limit: int = 30) -> None:
+        if not isinstance(facts, list):
+            return
+        existing = target.setdefault("facts", [])
+        if not isinstance(existing, list):
+            existing = []
+            target["facts"] = existing
+        for fact in facts:
+            if isinstance(fact, str):
+                clean = " ".join(fact.split())[:300]
+                if clean and clean not in existing:
+                    existing.append(clean)
+        del existing[:-limit]
+
+    def merge(
+        self,
+        chat_id: int,
+        user_id: int,
+        user_name: str,
+        chat_facts: object,
+        user_facts: object,
+    ) -> None:
+        chats = self.data.setdefault("chats", {})
+        users = self.data.setdefault("users", {})
+        chat = chats.setdefault(str(chat_id), {})
+        if isinstance(chat, dict):
+            self._normalize_scope(chat)
+            mutable_chat = chat["mutable"]
+            if isinstance(mutable_chat, dict):
+                self._add_facts(mutable_chat, chat_facts)
+        chat_users = users.setdefault(str(chat_id), {})
+        if isinstance(chat_users, dict):
+            extracted_users = user_facts if isinstance(user_facts, dict) else {}
+            if extracted_users and all(isinstance(value, dict) for value in extracted_users.values()):
+                for extracted_id, info in extracted_users.items():
+                    user = chat_users.setdefault(str(extracted_id), {})
+                    if isinstance(user, dict) and isinstance(info, dict):
+                        self._normalize_scope(user)
+                        # A manually configured name in memory.json is stable;
+                        # the model may only fill an empty name.
+                        if not user.get("name"):
+                            user["name"] = info.get("name") or ""
+                        mutable_user = user["mutable"]
+                        if isinstance(mutable_user, dict):
+                            self._add_facts(mutable_user, info.get("facts"))
+            else:
+                user = chat_users.setdefault(str(user_id), {"name": user_name})
+                if isinstance(user, dict):
+                    self._normalize_scope(user)
+                    user["name"] = user_name or user.get("name", "")
+                    mutable_user = user["mutable"]
+                    if isinstance(mutable_user, dict):
+                        self._add_facts(mutable_user, user_facts)
+        self._save()
+
+    def user_name(self, chat_id: int, user_id: int) -> str | None:
+        users = self.data.get("users", {})
+        chat_users = users.get(str(chat_id), {}) if isinstance(users, dict) else {}
+        user = chat_users.get(str(user_id), {}) if isinstance(chat_users, dict) else {}
+        if not isinstance(user, dict):
+            return None
+        name = user.get("name")
+        return str(name).strip() if isinstance(name, str) and name.strip() else None
+
+    @staticmethod
+    def _facts(scope: object, bucket: str) -> list[str]:
+        if not isinstance(scope, dict):
+            return []
+        values = scope.get(bucket, {})
+        if not isinstance(values, dict) or not isinstance(values.get("facts"), list):
+            return []
+        return [fact for fact in values["facts"] if isinstance(fact, str)]
+
+    def _scope_context(self, scope: object, label: str) -> list[str]:
+        blocks: list[str] = []
+        immutable = self._facts(scope, "immutable")
+        mutable = self._facts(scope, "mutable")
+        if immutable:
+            blocks.append(f"{label} immutable facts:\n- " + "\n- ".join(immutable))
+        if mutable:
+            blocks.append(f"{label} mutable facts:\n- " + "\n- ".join(mutable))
+        return blocks
+
+    def personal_context(self, chat_id: int, user_id: int) -> str:
+        users = self.data.get("users", {})
+        chat_users = users.get(str(chat_id), {}) if isinstance(users, dict) else {}
+        user = chat_users.get(str(user_id), {}) if isinstance(chat_users, dict) else {}
+        if not isinstance(user, dict):
+            return ""
+        name = user.get("name") or str(user_id)
+        return "\n\n".join(self._scope_context(user, f"{name} personal"))
+
+    def context(self, chat_id: int, exclude_user_id: int | None = None) -> str:
+        chats = self.data.get("chats", {})
+        users = self.data.get("users", {})
+        blocks: list[str] = []
+        chat = chats.get(str(chat_id), {}) if isinstance(chats, dict) else {}
+        blocks.extend(self._scope_context(chat, "Chat"))
+        chat_users = users.get(str(chat_id), {}) if isinstance(users, dict) else {}
+        if isinstance(chat_users, dict):
+            for stored_user_id, user in chat_users.items():
+                if exclude_user_id is not None and str(stored_user_id) == str(exclude_user_id):
+                    continue
+                if not isinstance(user, dict):
+                    continue
+                name = user.get("name") or stored_user_id
+                blocks.extend(self._scope_context(user, f"{name} personal"))
+        return "\n\n".join(blocks)
+
+
+class ReminderStore:
+    """Persistent one-shot reminder tasks."""
+
+    def __init__(self, filename: str) -> None:
+        self.path = project_path(filename)
+        self.data: dict[str, object] = {"version": 1, "reminders": []}
+        self._load()
+        if not self.path.exists():
+            self._save()
+        LOGGER.info("Reminders file: %s", self.path)
+
+    def _load(self) -> None:
+        try:
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                self.data.update(loaded)
+            reminders = self.data.get("reminders")
+            if not isinstance(reminders, list):
+                self.data["reminders"] = []
+            else:
+                # A process killed during delivery must not lose a reminder.
+                kept: list[object] = []
+                recovered = False
+                for reminder in reminders:
+                    if isinstance(reminder, dict) and reminder.get("status") == "completed":
+                        recovered = True
+                        continue
+                    if isinstance(reminder, dict) and reminder.get("status") == "processing":
+                        reminder["status"] = "active"
+                        recovered = True
+                    kept.append(reminder)
+                self.data["reminders"] = kept
+                if recovered:
+                    self._save()
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError):
+            LOGGER.warning("Could not load reminders file %s; starting empty", self.path)
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def add(
+        self,
+        chat_id: int,
+        user_id: int,
+        user_name: str,
+        due_at: datetime,
+        text: str,
+    ) -> dict[str, object]:
+        reminder = {
+            "id": uuid4().hex,
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "due_at": due_at.isoformat(),
+            "text": text,
+            "status": "active",
+            "created_at": datetime.now(due_at.tzinfo).isoformat(),
+        }
+        reminders = self.data.setdefault("reminders", [])
+        if not isinstance(reminders, list):
+            reminders = []
+            self.data["reminders"] = reminders
+        reminders.append(reminder)
+        self._save()
+        return reminder
+
+    def claim_due(self, now: datetime) -> list[dict[str, object]]:
+        reminders = self.data.get("reminders", [])
+        if not isinstance(reminders, list):
+            return []
+        claimed: list[dict[str, object]] = []
+        changed = False
+        for reminder in reminders:
+            if not isinstance(reminder, dict) or reminder.get("status") != "active":
+                continue
+            try:
+                due_at = datetime.fromisoformat(str(reminder["due_at"]))
+            except (KeyError, TypeError, ValueError):
+                LOGGER.warning("Ignoring reminder with invalid due_at: %r", reminder)
+                continue
+            if due_at.tzinfo is None:
+                due_at = due_at.replace(tzinfo=now.tzinfo)
+            if due_at <= now:
+                reminder["status"] = "processing"
+                claimed.append(reminder.copy())
+                changed = True
+                LOGGER.info(
+                    "Claiming due reminder %s (scheduled for %s)",
+                    reminder.get("id", ""),
+                    reminder.get("due_at", ""),
+                )
+        if changed:
+            self._save()
+        return claimed
+
+    def remove(self, reminder_id: str) -> None:
+        reminders = self.data.get("reminders", [])
+        if not isinstance(reminders, list):
+            return
+        self.data["reminders"] = [
+            reminder
+            for reminder in reminders
+            if not isinstance(reminder, dict) or reminder.get("id") != reminder_id
+        ]
+        self._save()
+
+    def release(self, reminder_id: str) -> None:
+        self._set_status(reminder_id, "active")
+
+    def _set_status(self, reminder_id: str, status: str) -> None:
+        reminders = self.data.get("reminders", [])
+        if not isinstance(reminders, list):
+            return
+        for reminder in reminders:
+            if isinstance(reminder, dict) and reminder.get("id") == reminder_id:
+                reminder["status"] = status
+                self._save()
+                return
+
+
+def parse_reminder(text: str, now: datetime) -> tuple[datetime, str] | None:
+    match = re.match(r"^\s*/н(?:@[A-Za-z0-9_]+)?\s+(.+?)\s*$", text, re.IGNORECASE)
+    if not match:
+        return None
+    body = match.group(1).strip()
+
+    relative = re.match(
+        r"^через\s+(\d+)\s*(минут(?:у|ы)?|час(?:а|ов)?|дн(?:я|ей)?)\s+(.+)$",
+        body,
+        re.IGNORECASE,
+    )
+    if relative:
+        amount = int(relative.group(1))
+        unit = relative.group(2).lower()
+        if unit.startswith("мин"):
+            delta = timedelta(minutes=amount)
+        elif unit.startswith("час"):
+            delta = timedelta(hours=amount)
+        else:
+            delta = timedelta(days=amount)
+        return now + delta, relative.group(3).strip()
+
+    day_time = re.match(
+        r"^(сегодня|завтра)\s+(\d{1,2}):(\d{2})\s+(.+)$", body, re.IGNORECASE
+    )
+    if day_time:
+        day = now.date() + timedelta(days=1 if day_time.group(1).lower() == "завтра" else 0)
+        try:
+            due_at = now.replace(
+                year=day.year,
+                month=day.month,
+                day=day.day,
+                hour=int(day_time.group(2)),
+                minute=int(day_time.group(3)),
+                second=0,
+                microsecond=0,
+            )
+        except ValueError:
+            return None
+        return due_at, day_time.group(4).strip()
+
+    date_time = re.match(
+        r"^(\d{1,2})[./-](\d{1,2})(?:[./-](\d{4}))?\s+(\d{1,2}):(\d{2})\s+(.+)$",
+        body,
+    )
+    if date_time:
+        year = int(date_time.group(3) or now.year)
+        try:
+            due_at = now.replace(
+                year=year,
+                month=int(date_time.group(2)),
+                day=int(date_time.group(1)),
+                hour=int(date_time.group(4)),
+                minute=int(date_time.group(5)),
+                second=0,
+                microsecond=0,
+            )
+        except ValueError:
+            return None
+        return due_at, date_time.group(6).strip()
+
+    clock = re.match(r"^(\d{1,2}):(\d{2})\s+(.+)$", body)
+    if clock:
+        try:
+            due_at = now.replace(
+                hour=int(clock.group(1)),
+                minute=int(clock.group(2)),
+                second=0,
+                microsecond=0,
+            )
+        except ValueError:
+            return None
+        if due_at <= now:
+            due_at += timedelta(days=1)
+        return due_at, clock.group(3).strip()
+    return None
+
+
 class ReplyService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.client = (
+        self.gigachat_client = (
             GigaChat(
                 credentials=settings.gigachat_credentials,
                 scope=settings.gigachat_scope,
@@ -164,63 +641,528 @@ class ReplyService:
                 max_retries=settings.gigachat_max_retries,
                 retry_backoff_factor=1.0,
             )
-            if settings.gigachat_credentials
+            if settings.ai_provider == "gigachat" and settings.gigachat_credentials
             else None
         )
-        self.history: dict[tuple[int, str], list[dict[str, str]]] = {}
+        self.vsegpt_client = (
+            OpenAI(
+                api_key=settings.vsegpt_api_key,
+                base_url=settings.vsegpt_base_url,
+                timeout=settings.gigachat_timeout,
+                max_retries=settings.gigachat_max_retries,
+            )
+            if settings.ai_provider == "vsegpt" and settings.vsegpt_api_key
+            else None
+        )
+        self.history: dict[tuple[int, str], list[dict[str, object]]] = {}
+        self.compacted_history: set[tuple[int, str]] = set()
+        self.memory = MemoryStore(settings.memory_file)
 
-    async def reply(self, chat_id: int, text: str, mode: str) -> str:
-        if not self.client:
+    def _api_messages(
+        self, key: tuple[int, str], messages: list[dict[str, object]]
+    ) -> list[dict[str, str]]:
+        def format_message(message: dict[str, object]) -> str:
+            content = str(message["content"])
+            if message.get("role") != "user":
+                return content
+            name = str(message.get("user_name") or message.get("user_id") or "пользователь")
+            name = name.replace('"', "'").strip() or "пользователь"
+            return f'Пишет "{name}":\n{content}'
+
+        if key not in self.compacted_history:
+            return [
+                {"role": str(message["role"]), "content": format_message(message)}
+                for message in messages
+            ]
+
+        users = [message for message in messages if message.get("role") == "user"]
+        assistants = [message for message in messages if message.get("role") == "assistant"]
+        if not users:
+            return []
+        latest_user = users[-1]
+        prior_users = users[:-1]
+        compacted: list[dict[str, str]] = []
+        if prior_users:
+            compacted.append(
+                {
+                    "role": "user",
+                    "content": "Earlier user messages are context only; do not answer them:\n"
+                    + "\n".join(format_message(item) for item in prior_users),
+                }
+            )
+        if assistants:
+            compacted.append(
+                {
+                    "role": "assistant",
+                    "content": "Previous assistant reply for context only:\n"
+                    + str(assistants[-1]["content"]),
+                }
+            )
+        compacted.append({"role": "user", "content": format_message(latest_user)})
+        return compacted
+
+    @staticmethod
+    def _facts_from_text(raw: str) -> dict[str, object] | None:
+        """Parse the deliberately simple text format returned by the memory call."""
+
+        if not isinstance(raw, str):
+            return None
+        text = raw.strip()
+        if not text or text.upper() == "EMPTY":
+            return {"chat_facts": [], "users": {}}
+
+        chat_facts: list[str] = []
+        users: dict[str, dict[str, object]] = {}
+        for line in text.splitlines():
+            line = line.strip().lstrip("-* ")
+            if not line:
+                continue
+            chat_match = re.match(r"CHAT_FACT\s*:\s*(.+)$", line, re.IGNORECASE)
+            if chat_match:
+                chat_facts.append(chat_match.group(1).strip())
+                continue
+            user_match = re.match(r"USER_FACT\s*:\s*([^|]+)\|([^|]*)\|(.+)$", line, re.IGNORECASE)
+            if user_match:
+                user_id, name, fact = (part.strip() for part in user_match.groups())
+                if user_id and fact:
+                    user = users.setdefault(user_id, {"name": name, "facts": []})
+                    facts = user.setdefault("facts", [])
+                    if isinstance(facts, list):
+                        facts.append(fact)
+
+        if not chat_facts and not users:
+            return None
+        return {"chat_facts": chat_facts, "users": users}
+
+    async def _extract_memory(
+        self,
+        chat_id: int,
+        user_id: int,
+        user_name: str,
+        old_messages: list[dict[str, object]],
+    ) -> bool:
+        if not old_messages:
+            return True
+        LOGGER.info(
+            "Extracting memory for chat %s from %s messages",
+            chat_id,
+            len(old_messages),
+        )
+        transcript_parts: list[str] = []
+        for item in old_messages:
+            if item.get("role") == "user":
+                name = str(item.get("user_name") or item.get("user_id") or "пользователь")
+                name = name.replace('"', "'").strip() or "пользователь"
+                transcript_parts.append(
+                    f'Пишет "{name}" (ID {item.get("user_id", "")}): {item["content"]}'
+                )
+            else:
+                transcript_parts.append(f'Бот ответил: {item["content"]}')
+        transcript = "\n".join(transcript_parts)
+        extractor_system = self.settings.memory_prompt
+        try:
+            request = [
+                {"role": "system", "content": extractor_system},
+                {"role": "user", "content": transcript},
+            ]
+            if self.settings.ai_provider == "gigachat":
+                response = await asyncio.to_thread(
+                    self.gigachat_client.chat.create,
+                    {"model": self.settings.gigachat_model, "messages": request},
+                )
+                if not response.messages:
+                    return False
+                parts = response.messages[0].content or []
+                raw = parts if isinstance(parts, str) else "".join(part.text or "" for part in parts)
+            else:
+                response = await asyncio.to_thread(
+                    self.vsegpt_client.chat.completions.create,
+                    model=self.settings.vsegpt_model,
+                    messages=request,
+                    max_tokens=self.settings.memory_max_tokens,
+                    temperature=0,
+                )
+                if not response.choices:
+                    return False
+                raw = response.choices[0].message.content or ""
+            extracted = self._facts_from_text(raw)
+            if extracted is None:
+                LOGGER.warning(
+                    "Memory extraction returned unparseable text for chat %s: %r",
+                    chat_id,
+                    str(raw)[:300],
+                )
+                return False
+            self.memory.merge(
+                chat_id,
+                user_id,
+                user_name,
+                extracted.get("chat_facts", []),
+                extracted.get("users", {}),
+            )
+            LOGGER.info("Memory saved for chat %s", chat_id)
+            return True
+        except Exception:
+            LOGGER.exception("Memory extraction failed")
+            return False
+
+    async def _prepare_history(
+        self,
+        chat_id: int,
+        user_id: int,
+        user_name: str,
+        text: str,
+        mode: str,
+    ) -> list[dict[str, object]]:
+        messages = self.history.setdefault((chat_id, mode), [])
+        history_limit = (
+            self.settings.max_english_history_messages
+            if mode == "english_coach"
+            else self.settings.soft_context_limit
+        )
+        messages.append(
+            {"role": "user", "content": text, "user_id": user_id, "user_name": user_name}
+        )
+        if mode == "english_coach":
+            messages[:] = messages[-history_limit:]
+            return messages
+
+        if len(messages) >= self.settings.hard_context_limit:
+            LOGGER.info(
+                "Hard context limit reached for chat %s, mode %s (%s entries)",
+                chat_id,
+                mode,
+                len(messages),
+            )
+            keep = min(self.settings.keep_last_messages, len(messages))
+            if await self._extract_memory(chat_id, user_id, user_name, messages[:-keep]):
+                messages[:] = messages[-keep:]
+                self.compacted_history.discard((chat_id, mode))
+                LOGGER.info("Hard context compaction completed for chat %s", chat_id)
+            else:
+                LOGGER.warning(
+                    "Hard context compaction skipped for chat %s because memory extraction failed",
+                    chat_id,
+                )
+
+        if len(messages) >= self.settings.soft_context_limit:
+            LOGGER.info(
+                "Soft context compaction for chat %s, mode %s (%s entries)",
+                chat_id,
+                mode,
+                len(messages),
+            )
+            user_messages = [item for item in messages if item.get("role") == "user"]
+            assistant_messages = [item for item in messages if item.get("role") == "assistant"]
+            messages[:] = user_messages + (assistant_messages[-1:] if assistant_messages else [])
+            self.compacted_history.add((chat_id, mode))
+        return messages
+
+    async def reply(
+        self, chat_id: int, user_id: int, user_name: str, text: str, mode: str
+    ) -> str:
+        if self.settings.ai_provider == "gigachat" and not self.gigachat_client:
             return (
                 "Я получил сообщение. Чтобы я формировал содержательные ответы, "
                 "добавьте GIGACHAT_CREDENTIALS в .env."
             )
+        if self.settings.ai_provider == "vsegpt" and not self.vsegpt_client:
+            return (
+                "Я получил сообщение. Чтобы я формировал содержательные ответы, "
+                "добавьте VSEGPT_API_KEY в .env."
+            )
 
-        messages = self.history.setdefault((chat_id, mode), [])
-        messages.append({"role": "user", "content": text})
-        messages[:] = messages[-self.settings.max_history_messages :]
+        configured_name = self.memory.user_name(chat_id, user_id)
+        speaker_name = configured_name or str(user_id)
+        messages = await self._prepare_history(chat_id, user_id, speaker_name, text, mode)
 
         try:
-            response = await asyncio.to_thread(
-                self.client.chat.create,
-                {
-                    "model": self.settings.gigachat_model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                self.settings.english_coach_prompt
-                                + "\n\nКритичное правило: отвечай только готовым "
-                                "улучшенным вариантом текста. После варианта дай "
-                                "1–3 коротких полезных совета. Не добавляй "
-                                "приветствия, оценки или воду."
-                                if mode == "english_coach"
-                                else self.settings.system_prompt
-                            ),
-                        },
-                        *messages,
-                    ],
-                },
-            )
-            if not response.messages:
-                raise RuntimeError("GigaChat returned an empty response")
-            parts = response.messages[0].content or []
-            answer = "".join(part.text or "" for part in parts).strip()
+            system_message = self.settings.english_coach_prompt if mode == "english_coach" else self.settings.system_prompt
+            if mode != "english_coach":
+                system_message += " Answer only the latest user message. Treat earlier messages as context. Follow these rules exactly."
+            request_messages = [
+                {"role": "system", "content": system_message},
+                *self._api_messages((chat_id, mode), messages),
+            ]
+            if request_messages and request_messages[-1].get("role") == "user":
+                context_parts: list[str] = []
+                if mode != "english_coach":
+                    personal_context = self.memory.personal_context(chat_id, user_id)
+                    chat_context = self.memory.context(chat_id, exclude_user_id=user_id)
+                    if personal_context:
+                        context_parts.append(
+                            "Персональная информация отправителя (контекст):\n"
+                            + personal_context
+                        )
+                    if chat_context:
+                        context_parts.append("Остальной контекст (справочно):\n" + chat_context)
+                context_parts.append(
+                    "Текущее время: "
+                    + timezone_now(self.settings.timezone).strftime("%Y-%m-%d %H:%M (%Z)")
+                )
+                request_messages[-1]["content"] += "\n\n" + "\n\n".join(context_parts)
+
+            if self.settings.ai_provider == "gigachat":
+                response = await asyncio.to_thread(
+                    self.gigachat_client.chat.create,
+                    {"model": self.settings.gigachat_model, "messages": request_messages},
+                )
+                if not response.messages:
+                    raise RuntimeError("GigaChat returned an empty response")
+                parts = response.messages[0].content or []
+                answer = "".join(part.text or "" for part in parts).strip()
+            else:
+                response = await asyncio.to_thread(
+                    self.vsegpt_client.chat.completions.create,
+                    model=self.settings.vsegpt_model,
+                    messages=request_messages,
+                    max_tokens=self.settings.vsegpt_max_tokens,
+                )
+                if not response.choices:
+                    raise RuntimeError("VseGPT returned an empty response")
+                answer = (response.choices[0].message.content or "").strip()
         except Exception:
             LOGGER.exception("AI response failed")
             answer = "Не смог обработать сообщение. Попробуйте ещё раз позже."
 
         if answer:
             messages.append({"role": "assistant", "content": answer})
-            messages[:] = messages[-self.settings.max_history_messages :]
+            if mode == "english_coach":
+                messages[:] = messages[-self.settings.max_english_history_messages :]
             return answer
-        return "Не смог сформировать ответ."
+        return "Модель вернула пустой ответ. Попробуйте ещё раз."
+
+    @staticmethod
+    def _scheduled_from_text(
+        raw: str, now: datetime, fallback_text: str
+    ) -> tuple[datetime, str] | None:
+        if not isinstance(raw, str):
+            return None
+        time_match = re.search(
+            r"(?:^|\n)\s*TIME\s*:\s*(\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}|NONE)",
+            raw,
+            re.IGNORECASE,
+        )
+        if not time_match or time_match.group(1).upper() == "NONE":
+            return None
+        try:
+            due_at = datetime.strptime(time_match.group(1), "%Y-%m-%d %H:%M").replace(
+                tzinfo=now.tzinfo
+            )
+        except ValueError:
+            return None
+        text_match = re.search(r"(?:^|\n)\s*TEXT\s*:\s*(.+)", raw, re.IGNORECASE | re.DOTALL)
+        reminder_text = text_match.group(1).strip() if text_match else fallback_text
+        return (due_at, reminder_text or fallback_text) if reminder_text else None
+
+    async def resolve_reminder(
+        self, command_text: str, now: datetime
+    ) -> tuple[datetime, str] | None:
+        """Let the model understand natural time, with a local parser fallback."""
+
+        fallback = parse_reminder(command_text, now)
+        client_available = (
+            self.settings.ai_provider == "vsegpt" and self.vsegpt_client
+        ) or (self.settings.ai_provider == "gigachat" and self.gigachat_client)
+        if not client_available:
+            return fallback
+
+        schedule_prompt = (
+            self.settings.reminder_schedule_prompt
+            + "\nCurrent local time: "
+            + now.strftime("%Y-%m-%d %H:%M")
+            + "\nTimezone: "
+            + self.settings.timezone
+        )
+        request = [
+            {"role": "system", "content": schedule_prompt},
+            {"role": "user", "content": command_text},
+        ]
+        try:
+            if self.settings.ai_provider == "gigachat":
+                response = await asyncio.to_thread(
+                    self.gigachat_client.chat.create,
+                    {"model": self.settings.gigachat_model, "messages": request},
+                )
+                if not response.messages:
+                    return fallback
+                parts = response.messages[0].content or []
+                raw = parts if isinstance(parts, str) else "".join(part.text or "" for part in parts)
+            else:
+                response = await asyncio.to_thread(
+                    self.vsegpt_client.chat.completions.create,
+                    model=self.settings.vsegpt_model,
+                    messages=request,
+                    max_tokens=min(self.settings.vsegpt_max_tokens, 100),
+                )
+                if not response.choices:
+                    return fallback
+                raw = response.choices[0].message.content or ""
+            command_body = re.sub(
+                r"^\s*/н(?:@[A-Za-z0-9_]+)?\s*", "", command_text, flags=re.IGNORECASE
+            ).strip()
+            return self._scheduled_from_text(raw, now, command_body) or fallback
+        except Exception:
+            LOGGER.exception("Reminder schedule interpretation failed")
+            return fallback
+
+    async def reminder_text(self, text: str) -> str | None:
+        """Generate a reminder from only its original text, without chat context."""
+
+        if self.settings.ai_provider == "gigachat" and not self.gigachat_client:
+            return None
+        if self.settings.ai_provider == "vsegpt" and not self.vsegpt_client:
+            return None
+        try:
+            request = [
+                {"role": "system", "content": self.settings.reminder_prompt},
+                {"role": "user", "content": text},
+            ]
+            if self.settings.ai_provider == "gigachat":
+                response = await asyncio.to_thread(
+                    self.gigachat_client.chat.create,
+                    {"model": self.settings.gigachat_model, "messages": request},
+                )
+                if not response.messages:
+                    return None
+                parts = response.messages[0].content or []
+                answer = parts if isinstance(parts, str) else "".join(part.text or "" for part in parts)
+            else:
+                response = await asyncio.to_thread(
+                    self.vsegpt_client.chat.completions.create,
+                    model=self.settings.vsegpt_model,
+                    messages=request,
+                    max_tokens=min(self.settings.vsegpt_max_tokens, 80),
+                )
+                if not response.choices:
+                    return None
+                answer = response.choices[0].message.content or ""
+            return answer.strip() or None
+        except Exception:
+            LOGGER.exception("Reminder generation failed")
+            return None
+
+    async def analyze_image(
+        self, image_bytes: bytes, prompt: str, speaker_name: str | None = None
+    ) -> str:
+        if not self.vsegpt_client:
+            return "Для анализа изображений выберите AI_PROVIDER=vsegpt и добавьте VSEGPT_API_KEY."
+        data_url = "data:image/jpeg;base64," + b64encode(image_bytes).decode("ascii")
+        try:
+            response = await asyncio.to_thread(
+                self.vsegpt_client.chat.completions.create,
+                model=self.settings.vsegpt_vision_model,
+                messages=[
+                    {"role": "system", "content": self.settings.vision_prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    f'Контекст отправителя: пишет "{speaker_name}".\n{prompt}'
+                                    if speaker_name
+                                    else prompt
+                                ),
+                            },
+                            {"type": "image_url", "image_url": data_url},
+                        ],
+                    }
+                ],
+                max_tokens=self.settings.vsegpt_max_tokens,
+            )
+            if not response.choices:
+                raise RuntimeError("VseGPT returned an empty vision response")
+            return (response.choices[0].message.content or "Не смог описать изображение.").strip()
+        except Exception:
+            LOGGER.exception("Image analysis failed")
+            return "Не смог проанализировать изображение. Проверьте баланс и доступность vision-модели."
+
+
+async def reminder_loop(application: Application) -> None:
+    store: ReminderStore = application.bot_data["reminder_store"]
+    service: ReplyService = application.bot_data["reply_service"]
+    settings = service.settings
+    LOGGER.info("Reminder scheduler started")
+    try:
+        while True:
+            now = timezone_now(settings.timezone)
+            for reminder in store.claim_due(now):
+                reminder_id = str(reminder.get("id", ""))
+                try:
+                    generated = await service.reminder_text(str(reminder.get("text", "")))
+                    if not generated:
+                        raise RuntimeError("Reminder model returned an empty response")
+                    await application.bot.send_message(
+                        chat_id=int(reminder["chat_id"]),
+                        text=generated,
+                    )
+                    store.remove(reminder_id)
+                    LOGGER.info("Reminder delivered: %s", reminder_id)
+                except Exception:
+                    LOGGER.exception("Reminder delivery failed: %s", reminder_id)
+                    store.release(reminder_id)
+            await asyncio.sleep(settings.reminder_poll_seconds)
+    except asyncio.CancelledError:
+        LOGGER.info("Reminder scheduler stopped")
+        raise
+
+
+async def start_background_tasks(application: Application) -> None:
+    application.bot_data["reminder_task"] = asyncio.create_task(reminder_loop(application))
+
+
+async def stop_background_tasks(application: Application) -> None:
+    task = application.bot_data.get("reminder_task")
+    if not isinstance(task, asyncio.Task):
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "Привет! Упомяните меня через @, начните сообщение с ?? или отправьте "
-        "сообщение на английском языке — и я отвечу."
+        "сообщение на английском языке — и я отвечу. Для анализа фото добавьте "
+        "подпись ?? ваш вопрос. Для напоминания используйте /н 18:30 текст."
+    )
+
+
+async def handle_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not message.text or not chat:
+        return
+    if message.from_user and message.from_user.is_bot:
+        return
+
+    service: ReplyService = context.application.bot_data["reply_service"]
+    now = timezone_now(service.settings.timezone)
+    parsed = await service.resolve_reminder(message.text, now)
+    if parsed is None:
+        await message.reply_text(
+            "Не смог понять время. Напиши, например: /н напомни завтра вечером купить продукты"
+        )
+        return
+    due_at, reminder_text = parsed
+    if not reminder_text:
+        await message.reply_text(
+            "После времени нужно написать текст напоминания. Например: /н 18:30 позвонить другу"
+        )
+        return
+
+    sender = message.from_user
+    user_id = sender.id if sender else 0
+    speaker_name = service.memory.user_name(chat.id, user_id) or str(user_id)
+    reminder_store: ReminderStore = context.application.bot_data["reminder_store"]
+    reminder = reminder_store.add(chat.id, user_id, speaker_name, due_at, reminder_text)
+    await message.reply_text(
+        "Напоминание поставлено на "
+        + due_at.strftime("%d.%m.%Y %H:%M")
+        + "."
     )
 
 
@@ -257,9 +1199,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     service: ReplyService = context.application.bot_data["reply_service"]
     # An explicit @ mention or ?? prefix selects the general assistant mode.
-    # English coaching is used only for an unaddressed English message.
+    # English coaching is used only for an unad dressed English message.
     mode = "general" if is_mentioned or is_question_trigger else "english_coach"
-    answer = await service.reply(update.effective_chat.id, prompt, mode)
+    sender = message.from_user
+    user_id = sender.id if sender else 0
+    user_name = (sender.full_name or sender.username or str(user_id)) if sender else "unknown"
+    answer = await service.reply(update.effective_chat.id, user_id, user_name, prompt, mode)
+    await message.reply_text(answer)
+
+
+def photo_analysis_prompt(caption: str) -> str | None:
+    match = re.match(r"^\s*(?:\?\?|/analyze(?:@[A-Za-z0-9_]+)?)\s*(.*)", caption, re.I)
+    if not match:
+        return None
+    return match.group(1).strip() or "Кратко опиши изображение."
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not message.photo or (message.from_user and message.from_user.is_bot):
+        return
+    caption = message.caption or ""
+    prompt = photo_analysis_prompt(caption)
+    if prompt is None:
+        return
+
+    service: ReplyService = context.application.bot_data["reply_service"]
+    if service.settings.ai_provider != "vsegpt":
+        await message.reply_text("Анализ изображений доступен при AI_PROVIDER=vsegpt.")
+        return
+
+    photo = message.photo[-1]
+    telegram_file = await context.bot.get_file(photo.file_id)
+    image_bytes = bytes(await telegram_file.download_as_bytearray())
+
+    sender = message.from_user
+    speaker_name = (
+        service.memory.user_name(update.effective_chat.id, sender.id)
+        if sender
+        else None
+    ) or (str(sender.id) if sender else "пользователь")
+    answer = await service.analyze_image(image_bytes, prompt, speaker_name)
     await message.reply_text(answer)
 
 
@@ -279,10 +1259,20 @@ def build_application(settings: Settings) -> Application:
         .get_updates_read_timeout(settings.telegram_timeout + 10)
         .get_updates_write_timeout(settings.telegram_timeout)
         .get_updates_pool_timeout(settings.telegram_timeout)
+        .post_init(start_background_tasks)
+        .post_shutdown(stop_background_tasks)
         .build()
     )
     application.bot_data["reply_service"] = ReplyService(settings)
+    application.bot_data["reminder_store"] = ReminderStore(settings.reminders_file)
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.Regex(r"^\s*/н(?:@[A-Za-z0-9_]+)?(?:\s+.*)?$"),
+            handle_reminder,
+        )
+    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)
     return application
@@ -294,18 +1284,19 @@ def main() -> None:
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     settings = Settings.from_env()
-    if not settings.gigachat_credentials:
+    if settings.ai_provider == "gigachat" and not settings.gigachat_credentials:
         LOGGER.warning("GIGACHAT_CREDENTIALS is not set; fallback replies will be used")
+    elif settings.ai_provider == "vsegpt" and not settings.vsegpt_api_key:
+        LOGGER.warning("VSEGPT_API_KEY is not set; fallback replies will be used")
     else:
-        LOGGER.info("Using GigaChat model: %s", settings.gigachat_model)
+        model = settings.gigachat_model if settings.ai_provider == "gigachat" else settings.vsegpt_model
+        LOGGER.info("Using %s model: %s", settings.ai_provider, model)
 
-    # Python 3.14 no longer creates a default event loop automatically, while
-    # some python-telegram-bot releases still expect one in run_polling().
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
+    # Some python-telegram-bot releases still expect an event loop before polling.
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
     LOGGER.info("Starting Telegram bot")
     build_application(settings).run_polling(allowed_updates=Update.ALL_TYPES)
