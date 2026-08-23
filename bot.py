@@ -38,6 +38,23 @@ from telegram.ext import (
 
 
 LOGGER = logging.getLogger(__name__)
+CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+
+
+def load_runtime_config() -> dict[str, object]:
+    """Load non-secret bot settings from the project configuration file."""
+
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as config_file:
+            config = json.load(config_file)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Configuration file is missing: {CONFIG_PATH}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON in configuration file: {CONFIG_PATH}") from exc
+
+    if not isinstance(config, dict):
+        raise RuntimeError(f"Configuration root must be a JSON object: {CONFIG_PATH}")
+    return config
 
 
 @dataclass(frozen=True)
@@ -72,14 +89,29 @@ class Settings:
     reminder_prompt: str
     timezone: str
     reminder_poll_seconds: int
+    log_level: str
 
     @classmethod
     def from_env(cls) -> "Settings":
+        config = load_runtime_config()
+
+        def value(name: str, default: object) -> object:
+            return config.get(name, default)
+
+        def text(name: str, default: str) -> str:
+            return str(value(name, default)).strip()
+
+        def integer(name: str, default: int) -> int:
+            return int(value(name, default))
+
+        def number(name: str, default: float) -> float:
+            return float(value(name, default))
+
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         if not token:
             raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
 
-        provider = os.getenv("AI_PROVIDER", "gigachat").strip().lower()
+        provider = text("ai_provider", "gigachat").lower()
         if provider not in {"gigachat", "vsegpt"}:
             raise RuntimeError("AI_PROVIDER must be either 'gigachat' or 'vsegpt'")
         vsegpt_api_key = os.getenv("VSEGPT_API_KEY", "").strip() or None
@@ -94,78 +126,53 @@ class Settings:
                 or os.getenv("OPENAI_API_KEY", "").strip()
                 or None
             ),
-            gigachat_scope=os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS").strip(),
-            gigachat_model=(
-                os.getenv("GIGACHAT_MODEL", "").strip()
-                or os.getenv("OPENAI_MODEL", "GigaChat-2-Pro").strip()
-            ),
-            gigachat_base_url=os.getenv("GIGACHAT_BASE_URL", "https://api.giga.chat/v1").strip(),
-            gigachat_verify_ssl=os.getenv("GIGACHAT_VERIFY_SSL_CERTS", "false").lower() == "true",
-            gigachat_timeout=float(os.getenv("GIGACHAT_TIMEOUT", "60")),
-            gigachat_max_retries=max(0, int(os.getenv("GIGACHAT_MAX_RETRIES", "3"))),
+            gigachat_scope=text("gigachat_scope", "GIGACHAT_API_PERS"),
+            gigachat_model=text("gigachat_model", "GigaChat-2-Pro"),
+            gigachat_base_url=text("gigachat_base_url", "https://api.giga.chat/v1"),
+            gigachat_verify_ssl=bool(value("gigachat_verify_ssl", False)),
+            gigachat_timeout=number("gigachat_timeout", 60),
+            gigachat_max_retries=max(0, integer("gigachat_max_retries", 3)),
             vsegpt_api_key=vsegpt_api_key,
-            vsegpt_model=os.getenv("VSEGPT_MODEL", "openai/gpt-4o-mini").strip(),
-            vsegpt_base_url=os.getenv("VSEGPT_BASE_URL", "https://api.vsegpt.ru/v1").strip(),
-            vsegpt_max_tokens=max(32, int(os.getenv("VSEGPT_MAX_TOKENS", "200"))),
-            vsegpt_vision_model=os.getenv(
-                "VSEGPT_VISION_MODEL", "vis-google/gemini-3-flash-pre"
-            ).strip(),
-            vision_prompt=os.getenv(
-                "VISION_PROMPT",
-                "Reply briefly in Russian like in a messenger. Do not use Markdown.",
-            ).strip(),
-            telegram_timeout=float(os.getenv("TELEGRAM_TIMEOUT", "30")),
-            system_prompt=os.getenv(
-                "SYSTEM_PROMPT",
-                "Ты полезный ассистент в Telegram-чате. "
-                "Отвечай кратко и по делу на русском языке, если пользователь "
-                "не попросил другой язык.",
-            ).strip(),
-            english_coach_prompt=os.getenv(
-                "ENGLISH_COACH_PROMPT",
-                "Ты носитель английского языка и опытный преподаватель. "
-                "Проверь английское сообщение пользователя. Если есть ошибки, "
-                "покажи исправленный вариант и кратко объясни каждую ошибку. "
-                "Если текст корректен, покажи более естественный вариант. "
-                "Не меняй смысл. Затем при необходимости добавь 1–3 коротких "
-                "совета. Не пиши приветствия, похвалу или лишние объяснения. "
-                "Примеры оставляй на английском.",
-            ).strip(),
-            soft_context_limit=max(2, int(os.getenv("SOFT_CONTEXT_LIMIT", "8"))),
-            hard_context_limit=max(3, int(os.getenv("HARD_CONTEXT_LIMIT", "20"))),
-            keep_last_messages=max(1, int(os.getenv("KEEP_LAST_MESSAGES", "2"))),
-            memory_file=os.getenv("MEMORY_FILE", "memory.json").strip() or "memory.json",
-            memory_max_tokens=max(64, int(os.getenv("MEMORY_MAX_TOKENS", "150"))),
-            memory_prompt=os.getenv(
-                "MEMORY_PROMPT",
-                "Extract only durable important facts from the transcript. "
-                "Return plain text only, never JSON or Markdown. Use one line per fact: "
-                "CHAT_FACT: fact or USER_FACT: user_id|name|fact. "
-                "If there are no durable facts, return EMPTY.",
-            ).strip(),
-            max_english_history_messages=max(
-                1, int(os.getenv("MAX_ENGLISH_HISTORY_MESSAGES", "1"))
+            vsegpt_model=text("vsegpt_model", "openai/gpt-4o-mini"),
+            vsegpt_base_url=text("vsegpt_base_url", "https://api.vsegpt.ru/v1"),
+            vsegpt_max_tokens=max(32, integer("vsegpt_max_tokens", 200)),
+            vsegpt_vision_model=text("vsegpt_vision_model", "vis-google/gemini-3-flash-pre"),
+            vision_prompt=text(
+                "vision_prompt", "Reply briefly in Russian like in a messenger. Do not use Markdown."
             ),
-            reminders_file=os.getenv("REMINDERS_FILE", "reminders.json").strip()
-            or "reminders.json",
-            reminder_schedule_prompt=os.getenv(
-                "REMINDER_SCHEDULE_PROMPT",
-                "Определи время напоминания из сообщения пользователя. "
-                "Учитывай текущее время и часовой пояс. Верни только две строки: "
-                "TIME: YYYY-MM-DD HH:MM и TEXT: краткий смысл напоминания. "
-                "Если время определить нельзя, верни TIME: NONE. Если пользователь "
-                "явно указал прошедшую дату или время, оставь его прошедшим: бот "
-                "должен выполнить такую задачу сразу. Для времени без даты выбирай "
-                "следующее наступление.",
-            ).strip(),
-            reminder_prompt=os.getenv(
-                "REMINDER_PROMPT",
-                "Пойми смысл исходного текста напоминания и сформулируй его естественно. "
-                "Напиши одну короткую фразу на русском. Не используй шаблон, не добавляй "
-                "новые факты, время, приветствие или Markdown. Верни только текст напоминания.",
-            ).strip(),
-            timezone=os.getenv("BOT_TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow",
-            reminder_poll_seconds=max(5, int(os.getenv("REMINDER_POLL_SECONDS", "15"))),
+            telegram_timeout=number("telegram_timeout", 30),
+            system_prompt=text(
+                "system_prompt",
+                "Ты полезный ассистент в Telegram-чате. Отвечай кратко и по делу на русском языке.",
+            ),
+            english_coach_prompt=text(
+                "english_coach_prompt",
+                "Act as a strict but friendly English teacher. Be concise and use plain text.",
+            ),
+            soft_context_limit=max(2, integer("soft_context_limit", 8)),
+            hard_context_limit=max(3, integer("hard_context_limit", 20)),
+            keep_last_messages=max(1, integer("keep_last_messages", 2)),
+            memory_file=text("memory_file", "memory.json") or "memory.json",
+            memory_max_tokens=max(64, integer("memory_max_tokens", 150)),
+            memory_prompt=text(
+                "memory_prompt",
+                "Extract durable facts only. Return plain text, never JSON or Markdown. "
+                "One fact per line: CHAT_FACT: fact or USER_FACT: user_id|name|fact. "
+                "If none, return EMPTY.",
+            ),
+            max_english_history_messages=max(1, integer("max_english_history_messages", 1)),
+            reminders_file=text("reminders_file", "reminders.json") or "reminders.json",
+            reminder_schedule_prompt=text(
+                "reminder_schedule_prompt",
+                "Определи время напоминания и верни TIME и TEXT отдельными строками.",
+            ),
+            reminder_prompt=text(
+                "reminder_prompt",
+                "Сформулируй одну короткую фразу напоминания на русском без Markdown.",
+            ),
+            timezone=text("timezone", "Europe/Moscow") or "Europe/Moscow",
+            reminder_poll_seconds=max(5, integer("reminder_poll_seconds", 15)),
+            log_level=text("log_level", "INFO").upper(),
         )
 
 
@@ -1296,13 +1303,13 @@ def build_application(settings: Settings) -> Application:
 
 def main() -> None:
     load_dotenv()
+    settings = Settings.from_env()
     logging.basicConfig(
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        level=settings.log_level,
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    settings = Settings.from_env()
     if settings.ai_provider == "gigachat" and not settings.gigachat_credentials:
         LOGGER.warning("GIGACHAT_CREDENTIALS is not set; fallback replies will be used")
     elif settings.ai_provider == "vsegpt" and not settings.vsegpt_api_key:
