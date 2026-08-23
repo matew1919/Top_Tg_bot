@@ -4,6 +4,7 @@
 .idea/
 memory.json
 reminders.json
+api_journal.jsonl
 bot_autostart.log
 happ_autostart.log
 __pycache__/

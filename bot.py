@@ -16,6 +16,7 @@ import os
 import re
 import asyncio
 import json
+import threading
 from base64 import b64encode
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone as dt_timezone
@@ -90,6 +91,9 @@ class Settings:
     timezone: str
     reminder_poll_seconds: int
     log_level: str
+    api_journal_file: str
+    api_journal_max_entries: int
+    api_journal_enabled: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -106,6 +110,12 @@ class Settings:
 
         def number(name: str, default: float) -> float:
             return float(value(name, default))
+
+        def boolean(name: str, default: bool) -> bool:
+            raw = value(name, default)
+            if isinstance(raw, bool):
+                return raw
+            return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         if not token:
@@ -158,7 +168,7 @@ class Settings:
                 "memory_prompt",
                 "Изучи CURRENT MEMORY и FULL CONVERSATION HISTORY. Верни полную "
                 "обновлённую память по чату и всем пользователям. Сохрани все факты "
-                "из текущей памяти. Добавь новые факты. Не удаляй факт, если он не "
+                "из текущей памяти и SHARED USER PROFILES. Добавь новые факты. Не удаляй факт, если он не "
                 "упомянут в истории. Верни только строки CHAT_FACT: факт или "
                 "USER_FACT: user_id|name|факт. Если фактов нет, верни EMPTY.",
             ),
@@ -175,6 +185,10 @@ class Settings:
             timezone=text("timezone", "Europe/Moscow") or "Europe/Moscow",
             reminder_poll_seconds=max(5, integer("reminder_poll_seconds", 15)),
             log_level=text("log_level", "INFO").upper(),
+            api_journal_file=text("api_journal_file", "api_journal.jsonl")
+            or "api_journal.jsonl",
+            api_journal_max_entries=max(1, integer("api_journal_max_entries", 200)),
+            api_journal_enabled=boolean("api_journal_enabled", True),
         )
 
 
@@ -253,6 +267,88 @@ def timezone_now(timezone_name: str) -> datetime:
     return datetime.now(timezone)
 
 
+class ApiJournal:
+    """Store the exact model messages and generated text without API secrets."""
+
+    def __init__(self, filename: str, max_entries: int, enabled: bool) -> None:
+        self.path = project_path(filename)
+        self.max_entries = max(1, max_entries)
+        self.enabled = enabled
+        self._lock = threading.Lock()
+        LOGGER.info("API journal: %s%s", self.path, " (enabled)" if enabled else " (disabled)")
+
+    @staticmethod
+    def _safe(value: object) -> object:
+        if isinstance(value, dict):
+            return {str(key): ApiJournal._safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [ApiJournal._safe(item) for item in value]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    def record(
+        self,
+        *,
+        provider: str,
+        model: str,
+        messages: object,
+        response: object,
+        kind: str,
+        chat_id: int | None,
+    ) -> None:
+        if not self.enabled:
+            return
+        entry = {
+            "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "provider": provider,
+            "model": model,
+            "kind": kind,
+            "chat_id": chat_id,
+            "messages": self._safe(messages),
+            "response": self._safe(response),
+        }
+        serialized = json.dumps(entry, ensure_ascii=False)
+        with self._lock:
+            try:
+                existing = (
+                    self.path.read_text(encoding="utf-8").splitlines()
+                    if self.path.exists()
+                    else []
+                )
+                existing.append(serialized)
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.path.write_text(
+                    "\n".join(existing[-self.max_entries :]) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError:
+                LOGGER.exception("Could not write API journal %s", self.path)
+
+    def recent(self, chat_id: int | None, limit: int) -> list[dict[str, object]]:
+        if not self.enabled or not self.path.exists():
+            return []
+        entries: list[dict[str, object]] = []
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            LOGGER.exception("Could not read API journal %s", self.path)
+            return []
+        for line in reversed(lines):
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(item, dict):
+                continue
+            if chat_id is not None and item.get("chat_id") != chat_id:
+                continue
+            entries.append(item)
+            if len(entries) >= limit:
+                break
+        return entries
+
+
 class MemoryStore:
     """Small local JSON store for chat-wide and per-user facts."""
 
@@ -260,7 +356,13 @@ class MemoryStore:
         # Keep a relative MEMORY_FILE next to bot.py, regardless of the
         # working directory selected by PyCharm or a terminal.
         self.path = project_path(filename)
-        self.data: dict[str, object] = {"version": 1, "chats": {}, "users": {}}
+        self.data: dict[str, object] = {
+            "version": 1,
+            "chats": {},
+            "users": {},
+            "profiles": {},
+            "chat_types": {},
+        }
         LOGGER.info("Memory file: %s", self.path)
         self._load()
         if not self.path.exists():
@@ -302,10 +404,16 @@ class MemoryStore:
         self.data["version"] = 1
         chats = self.data.setdefault("chats", {})
         users = self.data.setdefault("users", {})
+        profiles = self.data.setdefault("profiles", {})
+        chat_types = self.data.setdefault("chat_types", {})
         if not isinstance(chats, dict):
             self.data["chats"] = chats = {}
         if not isinstance(users, dict):
             self.data["users"] = users = {}
+        if not isinstance(profiles, dict):
+            self.data["profiles"] = profiles = {}
+        if not isinstance(chat_types, dict):
+            self.data["chat_types"] = chat_types = {}
         for chat in chats.values():
             if isinstance(chat, dict):
                 self._normalize_scope(chat)
@@ -315,6 +423,60 @@ class MemoryStore:
             for user in chat_users.values():
                 if isinstance(user, dict):
                     self._normalize_scope(user)
+        for profile in profiles.values():
+            if isinstance(profile, dict):
+                self._normalize_scope(profile)
+        self._backfill_shared_profiles()
+
+    @staticmethod
+    def _looks_private_chat(chat_id: str) -> bool:
+        """Telegram private chat IDs are positive; group/channel IDs are negative."""
+
+        try:
+            return int(chat_id) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def is_private_chat(self, chat_id: int) -> bool:
+        chat_types = self.data.get("chat_types", {})
+        chat_type = chat_types.get(str(chat_id)) if isinstance(chat_types, dict) else None
+        if chat_type == "private":
+            return True
+        if chat_type in {"group", "supergroup", "channel"}:
+            return False
+        return self._looks_private_chat(str(chat_id))
+
+    def set_chat_type(self, chat_id: int, chat_type: str | None) -> None:
+        if chat_type not in {"private", "group", "supergroup", "channel"}:
+            return
+        chat_types = self.data.setdefault("chat_types", {})
+        if not isinstance(chat_types, dict):
+            self.data["chat_types"] = chat_types = {}
+        if chat_types.get(str(chat_id)) != chat_type:
+            chat_types[str(chat_id)] = chat_type
+            self._save()
+
+    def _backfill_shared_profiles(self) -> None:
+        """Migrate old per-chat group facts into the cross-chat profile index."""
+
+        profiles = self.data.get("profiles", {})
+        users = self.data.get("users", {})
+        if not isinstance(profiles, dict) or not isinstance(users, dict):
+            return
+        for stored_chat_id, chat_users in users.items():
+            if self.is_private_chat(int(stored_chat_id)) or not isinstance(chat_users, dict):
+                continue
+            for stored_user_id, user in chat_users.items():
+                if not isinstance(user, dict):
+                    continue
+                profile = profiles.setdefault(str(stored_user_id), {})
+                if not isinstance(profile, dict):
+                    continue
+                self._normalize_scope(profile)
+                if not profile.get("name") and user.get("name"):
+                    profile["name"] = str(user["name"]).strip()
+                self._add_facts(profile["mutable"], self._facts(user, "mutable"))
+                self._add_facts(profile["immutable"], self._facts(user, "immutable"))
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -337,6 +499,25 @@ class MemoryStore:
                     existing.append(clean)
         del existing[:-limit]
 
+    def _sync_shared_profile(
+        self,
+        user_id: str,
+        name: object,
+        facts: object,
+        immutable_facts: object = None,
+    ) -> None:
+        profiles = self.data.setdefault("profiles", {})
+        if not isinstance(profiles, dict):
+            self.data["profiles"] = profiles = {}
+        profile = profiles.setdefault(str(user_id), {})
+        if not isinstance(profile, dict):
+            return
+        self._normalize_scope(profile)
+        if not profile.get("name") and name:
+            profile["name"] = str(name).strip()
+        self._add_facts(profile["mutable"], facts)
+        self._add_facts(profile["immutable"], immutable_facts)
+
     def merge(
         self,
         chat_id: int,
@@ -347,6 +528,7 @@ class MemoryStore:
     ) -> None:
         chats = self.data.setdefault("chats", {})
         users = self.data.setdefault("users", {})
+        shared_chat = not self.is_private_chat(chat_id)
         chat = chats.setdefault(str(chat_id), {})
         if isinstance(chat, dict):
             self._normalize_scope(chat)
@@ -368,6 +550,12 @@ class MemoryStore:
                         mutable_user = user["mutable"]
                         if isinstance(mutable_user, dict):
                             self._add_facts(mutable_user, info.get("facts"))
+                        if shared_chat:
+                            self._sync_shared_profile(
+                                str(extracted_id),
+                                user.get("name") or info.get("name"),
+                                info.get("facts"),
+                            )
             else:
                 user = chat_users.setdefault(str(user_id), {"name": user_name})
                 if isinstance(user, dict):
@@ -376,16 +564,62 @@ class MemoryStore:
                     mutable_user = user["mutable"]
                     if isinstance(mutable_user, dict):
                         self._add_facts(mutable_user, user_facts)
+                    if shared_chat:
+                        self._sync_shared_profile(str(user_id), user_name, user_facts)
         self._save()
 
     def user_name(self, chat_id: int, user_id: int) -> str | None:
         users = self.data.get("users", {})
         chat_users = users.get(str(chat_id), {}) if isinstance(users, dict) else {}
         user = chat_users.get(str(user_id), {}) if isinstance(chat_users, dict) else {}
+        profiles = self.data.get("profiles", {})
+        profile = profiles.get(str(user_id), {}) if isinstance(profiles, dict) else {}
+        if self.is_private_chat(chat_id) and isinstance(profile, dict):
+            name = profile.get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+        if isinstance(user, dict):
+            name = user.get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+        if isinstance(profile, dict):
+            name = profile.get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+        return None
+
+    def remember_user(
+        self, chat_id: int, user_id: int, user_name: str, chat_type: str | None
+    ) -> None:
+        """Remember a Telegram name locally and in shared profiles only for public chats."""
+
+        users = self.data.setdefault("users", {})
+        if not isinstance(users, dict):
+            self.data["users"] = users = {}
+        chat_users = users.setdefault(str(chat_id), {})
+        if not isinstance(chat_users, dict):
+            self.data["users"][str(chat_id)] = chat_users = {}
+        user = chat_users.setdefault(str(user_id), {})
         if not isinstance(user, dict):
-            return None
-        name = user.get("name")
-        return str(name).strip() if isinstance(name, str) and name.strip() else None
+            return
+        self._normalize_scope(user)
+        changed = False
+        if user_name and user.get("name") != user_name:
+            user["name"] = user_name
+            changed = True
+        self.set_chat_type(chat_id, chat_type)
+        if chat_type in {"group", "supergroup", "channel"}:
+            profiles = self.data.setdefault("profiles", {})
+            if not isinstance(profiles, dict):
+                self.data["profiles"] = profiles = {}
+            profile = profiles.setdefault(str(user_id), {})
+            if isinstance(profile, dict):
+                self._normalize_scope(profile)
+                if user_name and not profile.get("name"):
+                    profile["name"] = user_name
+                    changed = True
+        if changed:
+            self._save()
 
     @staticmethod
     def _facts(scope: object, bucket: str) -> list[str]:
@@ -410,10 +644,16 @@ class MemoryStore:
         users = self.data.get("users", {})
         chat_users = users.get(str(chat_id), {}) if isinstance(users, dict) else {}
         user = chat_users.get(str(user_id), {}) if isinstance(chat_users, dict) else {}
-        if not isinstance(user, dict):
-            return ""
-        name = user.get("name") or str(user_id)
-        return "\n\n".join(self._scope_context(user, f"{name} personal"))
+        blocks: list[str] = []
+        if isinstance(user, dict):
+            name = user.get("name") or str(user_id)
+            blocks.extend(self._scope_context(user, f"{name} personal in this chat"))
+        profiles = self.data.get("profiles", {})
+        profile = profiles.get(str(user_id), {}) if isinstance(profiles, dict) else {}
+        if isinstance(profile, dict):
+            name = profile.get("name") or str(user_id)
+            blocks.extend(self._scope_context(profile, f"{name} shared profile"))
+        return "\n\n".join(blocks)
 
     def context(self, chat_id: int, exclude_user_id: int | None = None) -> str:
         chats = self.data.get("chats", {})
@@ -430,6 +670,10 @@ class MemoryStore:
                     continue
                 name = user.get("name") or stored_user_id
                 blocks.extend(self._scope_context(user, f"{name} personal"))
+                profiles = self.data.get("profiles", {})
+                profile = profiles.get(str(stored_user_id), {}) if isinstance(profiles, dict) else {}
+                if isinstance(profile, dict):
+                    blocks.extend(self._scope_context(profile, f"{name} shared profile"))
         return "\n\n".join(blocks)
 
     def memory_snapshot(self, chat_id: int) -> str:
@@ -457,6 +701,19 @@ class MemoryStore:
                 for bucket in ("immutable", "mutable"):
                     for fact in self._facts(user, bucket):
                         lines.append(f"USER_{bucket.upper()}_FACT: {fact}")
+
+            profiles = self.data.get("profiles", {})
+            if isinstance(profiles, dict):
+                lines.append("SHARED USER PROFILES:")
+                for stored_user_id in chat_users:
+                    profile = profiles.get(str(stored_user_id), {})
+                    if not isinstance(profile, dict):
+                        continue
+                    name = str(profile.get("name") or "").strip()
+                    lines.append(f"PROFILE: {stored_user_id}|{name}")
+                    for bucket in ("immutable", "mutable"):
+                        for fact in self._facts(profile, bucket):
+                            lines.append(f"PROFILE_{bucket.upper()}_FACT: {fact}")
 
         return "\n".join(lines) if lines else "EMPTY"
 
@@ -511,6 +768,19 @@ class MemoryStore:
             mutable_user = user["mutable"]
             if isinstance(mutable_user, dict):
                 self._add_facts(mutable_user, info.get("facts"))
+
+        # Public chat facts become part of the cross-chat profile index.
+        # Private-chat facts deliberately stay inside that private chat.
+        if not self.is_private_chat(chat_id):
+            for stored_user_id, user in chat_users.items():
+                if not isinstance(user, dict):
+                    continue
+                self._sync_shared_profile(
+                    str(stored_user_id),
+                    user.get("name"),
+                    self._facts(user, "mutable"),
+                    self._facts(user, "immutable"),
+                )
 
         self._save()
 
@@ -748,6 +1018,11 @@ class ReplyService:
         self.history: dict[tuple[int, str], list[dict[str, object]]] = {}
         self.compacted_history: set[tuple[int, str]] = set()
         self.memory = MemoryStore(settings.memory_file)
+        self.journal = ApiJournal(
+            settings.api_journal_file,
+            settings.api_journal_max_entries,
+            settings.api_journal_enabled,
+        )
 
     @staticmethod
     def _is_retryable_api_error(error: Exception) -> bool:
@@ -758,16 +1033,72 @@ class ReplyService:
             or (isinstance(status_code, int) and status_code >= 500)
         )
 
-    async def _vsegpt_chat(self, **kwargs: object):
+    @staticmethod
+    def _vsegpt_response_text(response: object) -> str:
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            return ""
+        message = getattr(choices[0], "message", None)
+        content = getattr(message, "content", "") if message else ""
+        return content if isinstance(content, str) else str(content or "")
+
+    @staticmethod
+    def _gigachat_response_text(response: object) -> str:
+        messages = getattr(response, "messages", None) or []
+        if not messages:
+            return ""
+        content = getattr(messages[0], "content", "")
+        if isinstance(content, str):
+            return content
+        parts = content or []
+        return "".join(str(getattr(part, "text", "") or "") for part in parts)
+
+    async def _gigachat_chat(
+        self,
+        request: list[dict[str, object]],
+        *,
+        kind: str,
+        chat_id: int | None,
+    ):
+        response = await asyncio.to_thread(
+            self.gigachat_client.chat.create,
+            {"model": self.settings.gigachat_model, "messages": request},
+        )
+        self.journal.record(
+            provider="gigachat",
+            model=self.settings.gigachat_model,
+            kind=kind,
+            chat_id=chat_id,
+            messages=request,
+            response=self._gigachat_response_text(response),
+        )
+        return response
+
+    async def _vsegpt_chat(
+        self,
+        *,
+        kind: str = "chat",
+        chat_id: int | None = None,
+        **kwargs: object,
+    ):
         """Call VseGPT with bounded retries for network and server failures."""
 
         attempts = max(1, self.settings.gigachat_max_retries + 1)
         for attempt in range(attempts):
             try:
-                return await asyncio.to_thread(
+                response = await asyncio.to_thread(
                     self.vsegpt_client.chat.completions.create,
                     **kwargs,
                 )
+                self.journal.record(
+                    provider="vsegpt",
+                    model=str(kwargs.get("model", "")),
+                    kind=kind,
+                    chat_id=chat_id,
+                    messages=kwargs.get("messages", []),
+                    response=self._vsegpt_response_text(response),
+                )
+                return response
             except Exception as error:
                 if attempt + 1 >= attempts or not self._is_retryable_api_error(error):
                     raise
@@ -897,9 +1228,10 @@ class ReplyService:
                 },
             ]
             if self.settings.ai_provider == "gigachat":
-                response = await asyncio.to_thread(
-                    self.gigachat_client.chat.create,
-                    {"model": self.settings.gigachat_model, "messages": request},
+                response = await self._gigachat_chat(
+                    request,
+                    kind="memory",
+                    chat_id=chat_id,
                 )
                 if not response.messages:
                     return False
@@ -911,6 +1243,8 @@ class ReplyService:
                     messages=request,
                     max_tokens=self.settings.memory_max_tokens,
                     temperature=0,
+                    kind="memory",
+                    chat_id=chat_id,
                 )
                 if not response.choices:
                     return False
@@ -989,7 +1323,13 @@ class ReplyService:
         return messages
 
     async def reply(
-        self, chat_id: int, user_id: int, user_name: str, text: str, mode: str
+        self,
+        chat_id: int,
+        user_id: int,
+        user_name: str,
+        text: str,
+        mode: str,
+        chat_type: str | None = None,
     ) -> str:
         if self.settings.ai_provider == "gigachat" and not self.gigachat_client:
             return (
@@ -1002,6 +1342,8 @@ class ReplyService:
                 "добавьте VSEGPT_API_KEY в .env."
             )
 
+        self.memory.set_chat_type(chat_id, chat_type)
+        self.memory.remember_user(chat_id, user_id, user_name, chat_type)
         configured_name = self.memory.user_name(chat_id, user_id)
         speaker_name = configured_name or str(user_id)
         messages = await self._prepare_history(chat_id, user_id, speaker_name, text, mode)
@@ -1031,9 +1373,10 @@ class ReplyService:
                 request_messages[-1]["content"] += "\n\n" + "\n\n".join(context_parts)
 
             if self.settings.ai_provider == "gigachat":
-                response = await asyncio.to_thread(
-                    self.gigachat_client.chat.create,
-                    {"model": self.settings.gigachat_model, "messages": request_messages},
+                response = await self._gigachat_chat(
+                    request_messages,
+                    kind="reply",
+                    chat_id=chat_id,
                 )
                 if not response.messages:
                     raise RuntimeError("GigaChat returned an empty response")
@@ -1044,6 +1387,8 @@ class ReplyService:
                     model=self.settings.vsegpt_model,
                     messages=request_messages,
                     max_tokens=self.settings.vsegpt_max_tokens,
+                    kind="reply",
+                    chat_id=chat_id,
                 )
                 if not response.choices:
                     raise RuntimeError("VseGPT returned an empty response")
@@ -1083,7 +1428,7 @@ class ReplyService:
         return (due_at, reminder_text or fallback_text) if reminder_text else None
 
     async def resolve_reminder(
-        self, command_text: str, now: datetime
+        self, command_text: str, now: datetime, chat_id: int | None = None
     ) -> tuple[datetime, str] | None:
         """Let the model understand natural time, with a local parser fallback."""
 
@@ -1107,9 +1452,10 @@ class ReplyService:
         ]
         try:
             if self.settings.ai_provider == "gigachat":
-                response = await asyncio.to_thread(
-                    self.gigachat_client.chat.create,
-                    {"model": self.settings.gigachat_model, "messages": request},
+                response = await self._gigachat_chat(
+                    request,
+                    kind="reminder_schedule",
+                    chat_id=chat_id,
                 )
                 if not response.messages:
                     return fallback
@@ -1120,6 +1466,8 @@ class ReplyService:
                     model=self.settings.vsegpt_model,
                     messages=request,
                     max_tokens=min(self.settings.vsegpt_max_tokens, 100),
+                    kind="reminder_schedule",
+                    chat_id=chat_id,
                 )
                 if not response.choices:
                     return fallback
@@ -1132,7 +1480,7 @@ class ReplyService:
             LOGGER.exception("Reminder schedule interpretation failed")
             return fallback
 
-    async def reminder_text(self, text: str) -> str | None:
+    async def reminder_text(self, text: str, chat_id: int | None = None) -> str | None:
         """Generate a reminder from only its original text, without chat context."""
 
         if self.settings.ai_provider == "gigachat" and not self.gigachat_client:
@@ -1145,9 +1493,10 @@ class ReplyService:
                 {"role": "user", "content": text},
             ]
             if self.settings.ai_provider == "gigachat":
-                response = await asyncio.to_thread(
-                    self.gigachat_client.chat.create,
-                    {"model": self.settings.gigachat_model, "messages": request},
+                response = await self._gigachat_chat(
+                    request,
+                    kind="reminder",
+                    chat_id=chat_id,
                 )
                 if not response.messages:
                     return None
@@ -1158,6 +1507,8 @@ class ReplyService:
                     model=self.settings.vsegpt_model,
                     messages=request,
                     max_tokens=min(self.settings.vsegpt_max_tokens, 80),
+                    kind="reminder",
+                    chat_id=chat_id,
                 )
                 if not response.choices:
                     return None
@@ -1168,7 +1519,11 @@ class ReplyService:
             return None
 
     async def analyze_image(
-        self, image_bytes: bytes, prompt: str, speaker_name: str | None = None
+        self,
+        image_bytes: bytes,
+        prompt: str,
+        speaker_name: str | None = None,
+        chat_id: int | None = None,
     ) -> str:
         if not self.vsegpt_client:
             return "Для анализа изображений выберите AI_PROVIDER=vsegpt и добавьте VSEGPT_API_KEY."
@@ -1194,6 +1549,8 @@ class ReplyService:
                     }
                 ],
                 max_tokens=self.settings.vsegpt_max_tokens,
+                kind="vision",
+                chat_id=chat_id,
             )
             if not response.choices:
                 raise RuntimeError("VseGPT returned an empty vision response")
@@ -1214,7 +1571,10 @@ async def reminder_loop(application: Application) -> None:
             for reminder in store.claim_due(now):
                 reminder_id = str(reminder.get("id", ""))
                 try:
-                    generated = await service.reminder_text(str(reminder.get("text", "")))
+                    generated = await service.reminder_text(
+                        str(reminder.get("text", "")),
+                        int(reminder["chat_id"]),
+                    )
                     if not generated:
                         raise RuntimeError("Reminder model returned an empty response")
                     await application.bot.send_message(
@@ -1266,8 +1626,53 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/н напомни завтра вечером купить продукты.\n"
         "/start — краткое описание.\n"
         "/help — эта справка.\n\n"
+        "/log [N] — последние запросы к API в этом чате.\n\n"
         "Память и напоминания сохраняются локально в файлах приложения."
     )
+
+
+def _journal_value(value: object, limit: int = 1800) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        text = json.dumps(value, ensure_ascii=False, indent=2)
+    if len(text) > limit:
+        return text[:limit] + "\n...[обрезано в Telegram, полный текст в файле журнала]"
+    return text
+
+
+async def api_log_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat:
+        return
+    service: ReplyService = context.application.bot_data["reply_service"]
+    if not service.journal.enabled:
+        await message.reply_text("Журнал API отключён в config.json.")
+        return
+    try:
+        limit = max(1, min(10, int(context.args[0]))) if context.args else 5
+    except ValueError:
+        limit = 5
+    entries = service.journal.recent(chat.id, limit)
+    if not entries:
+        await message.reply_text("В журнале этого чата пока нет запросов к модели.")
+        return
+
+    chunks: list[str] = []
+    for number, entry in enumerate(reversed(entries), 1):
+        chunks.append(
+            f"Запрос {number} | {entry.get('timestamp', '')} | "
+            f"{entry.get('kind', 'chat')} | {entry.get('provider', '')}/{entry.get('model', '')}\n"
+            "Модель получила:\n"
+            + _journal_value(entry.get("messages"))
+            + "\n\nМодель вывела:\n"
+            + _journal_value(entry.get("response"))
+        )
+    text = "\n\n====================\n\n".join(chunks)
+    while text:
+        part, text = text[:3800], text[3800:]
+        await message.reply_text(part)
 
 
 async def handle_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1280,7 +1685,7 @@ async def handle_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     service: ReplyService = context.application.bot_data["reply_service"]
     now = timezone_now(service.settings.timezone)
-    parsed = await service.resolve_reminder(message.text, now)
+    parsed = await service.resolve_reminder(message.text, now, chat.id)
     if parsed is None:
         await message.reply_text(
             "Не смог понять время. Напиши, например: /н напомни завтра вечером купить продукты"
@@ -1295,6 +1700,13 @@ async def handle_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     sender = message.from_user
     user_id = sender.id if sender else 0
+    if sender:
+        service.memory.remember_user(
+            chat.id,
+            user_id,
+            sender.full_name or sender.username or str(user_id),
+            chat.type,
+        )
     speaker_name = service.memory.user_name(chat.id, user_id) or str(user_id)
     reminder_store: ReminderStore = context.application.bot_data["reminder_store"]
     reminder = reminder_store.add(chat.id, user_id, speaker_name, due_at, reminder_text)
@@ -1343,7 +1755,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     sender = message.from_user
     user_id = sender.id if sender else 0
     user_name = (sender.full_name or sender.username or str(user_id)) if sender else "unknown"
-    answer = await service.reply(update.effective_chat.id, user_id, user_name, prompt, mode)
+    answer = await service.reply(
+        update.effective_chat.id,
+        user_id,
+        user_name,
+        prompt,
+        mode,
+        update.effective_chat.type,
+    )
     await message.reply_text(answer)
 
 
@@ -1373,12 +1792,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     image_bytes = bytes(await telegram_file.download_as_bytearray())
 
     sender = message.from_user
+    service.memory.set_chat_type(update.effective_chat.id, update.effective_chat.type)
     speaker_name = (
         service.memory.user_name(update.effective_chat.id, sender.id)
         if sender
         else None
     ) or (str(sender.id) if sender else "пользователь")
-    answer = await service.analyze_image(image_bytes, prompt, speaker_name)
+    answer = await service.analyze_image(
+        image_bytes,
+        prompt,
+        speaker_name,
+        update.effective_chat.id,
+    )
     await message.reply_text(answer)
 
 
@@ -1407,6 +1832,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler(["log", "journal"], api_log_command))
     application.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(r"^\s*/н(?:@[A-Za-z0-9_]+)?(?:\s+.*)?$"),
