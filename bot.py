@@ -1745,11 +1745,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         prompt = "Расскажи, чем ты можешь помочь."
 
     service: ReplyService = context.application.bot_data["reply_service"]
-    # An explicit @ mention or ?? prefix selects the general assistant mode.
-    # English coaching is used only for an unad dressed English message.
+    # Private chats always use the regular assistant; English coaching is group-only.
     mode = (
         "general"
-        if is_mentioned or is_question_trigger or (is_private_chat and not is_english)
+        if is_private_chat or is_mentioned or is_question_trigger
         else "english_coach"
     )
     sender = message.from_user
