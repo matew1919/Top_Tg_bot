@@ -168,8 +168,9 @@ class Settings:
                 "memory_prompt",
                 "Изучи CURRENT MEMORY и FULL CONVERSATION HISTORY. Верни полную "
                 "обновлённую память по чату и всем пользователям. Сохрани все факты "
-                "из текущей памяти и SHARED USER PROFILES. Добавь новые факты. Не удаляй факт, если он не "
-                "упомянут в истории. Верни только строки CHAT_FACT: факт или "
+                "из текущей памяти. Добавь новые факты. Не удаляй факт, если он не "
+                "упомянут в истории. Блоки SHARED CHAT MEMORIES справочные и не "
+                "смешиваются с текущим чатом. Верни только строки CHAT_FACT: факт или "
                 "USER_FACT: user_id|name|факт. Если фактов нет, верни EMPTY.",
             ),
             max_english_history_messages=max(1, integer("max_english_history_messages", 1)),
@@ -360,7 +361,6 @@ class MemoryStore:
             "version": 1,
             "chats": {},
             "users": {},
-            "profiles": {},
             "chat_types": {},
         }
         LOGGER.info("Memory file: %s", self.path)
@@ -404,14 +404,14 @@ class MemoryStore:
         self.data["version"] = 1
         chats = self.data.setdefault("chats", {})
         users = self.data.setdefault("users", {})
-        profiles = self.data.setdefault("profiles", {})
         chat_types = self.data.setdefault("chat_types", {})
+        # Older branch versions created a merged global profile index. It is
+        # intentionally discarded: shared-chat memories must stay separate.
+        self.data.pop("profiles", None)
         if not isinstance(chats, dict):
             self.data["chats"] = chats = {}
         if not isinstance(users, dict):
             self.data["users"] = users = {}
-        if not isinstance(profiles, dict):
-            self.data["profiles"] = profiles = {}
         if not isinstance(chat_types, dict):
             self.data["chat_types"] = chat_types = {}
         for chat in chats.values():
@@ -423,10 +423,6 @@ class MemoryStore:
             for user in chat_users.values():
                 if isinstance(user, dict):
                     self._normalize_scope(user)
-        for profile in profiles.values():
-            if isinstance(profile, dict):
-                self._normalize_scope(profile)
-        self._backfill_shared_profiles()
 
     @staticmethod
     def _looks_private_chat(chat_id: str) -> bool:
@@ -456,28 +452,6 @@ class MemoryStore:
             chat_types[str(chat_id)] = chat_type
             self._save()
 
-    def _backfill_shared_profiles(self) -> None:
-        """Migrate old per-chat group facts into the cross-chat profile index."""
-
-        profiles = self.data.get("profiles", {})
-        users = self.data.get("users", {})
-        if not isinstance(profiles, dict) or not isinstance(users, dict):
-            return
-        for stored_chat_id, chat_users in users.items():
-            if self.is_private_chat(int(stored_chat_id)) or not isinstance(chat_users, dict):
-                continue
-            for stored_user_id, user in chat_users.items():
-                if not isinstance(user, dict):
-                    continue
-                profile = profiles.setdefault(str(stored_user_id), {})
-                if not isinstance(profile, dict):
-                    continue
-                self._normalize_scope(profile)
-                if not profile.get("name") and user.get("name"):
-                    profile["name"] = str(user["name"]).strip()
-                self._add_facts(profile["mutable"], self._facts(user, "mutable"))
-                self._add_facts(profile["immutable"], self._facts(user, "immutable"))
-
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(
@@ -499,25 +473,6 @@ class MemoryStore:
                     existing.append(clean)
         del existing[:-limit]
 
-    def _sync_shared_profile(
-        self,
-        user_id: str,
-        name: object,
-        facts: object,
-        immutable_facts: object = None,
-    ) -> None:
-        profiles = self.data.setdefault("profiles", {})
-        if not isinstance(profiles, dict):
-            self.data["profiles"] = profiles = {}
-        profile = profiles.setdefault(str(user_id), {})
-        if not isinstance(profile, dict):
-            return
-        self._normalize_scope(profile)
-        if not profile.get("name") and name:
-            profile["name"] = str(name).strip()
-        self._add_facts(profile["mutable"], facts)
-        self._add_facts(profile["immutable"], immutable_facts)
-
     def merge(
         self,
         chat_id: int,
@@ -528,7 +483,6 @@ class MemoryStore:
     ) -> None:
         chats = self.data.setdefault("chats", {})
         users = self.data.setdefault("users", {})
-        shared_chat = not self.is_private_chat(chat_id)
         chat = chats.setdefault(str(chat_id), {})
         if isinstance(chat, dict):
             self._normalize_scope(chat)
@@ -550,12 +504,6 @@ class MemoryStore:
                         mutable_user = user["mutable"]
                         if isinstance(mutable_user, dict):
                             self._add_facts(mutable_user, info.get("facts"))
-                        if shared_chat:
-                            self._sync_shared_profile(
-                                str(extracted_id),
-                                user.get("name") or info.get("name"),
-                                info.get("facts"),
-                            )
             else:
                 user = chat_users.setdefault(str(user_id), {"name": user_name})
                 if isinstance(user, dict):
@@ -564,34 +512,33 @@ class MemoryStore:
                     mutable_user = user["mutable"]
                     if isinstance(mutable_user, dict):
                         self._add_facts(mutable_user, user_facts)
-                    if shared_chat:
-                        self._sync_shared_profile(str(user_id), user_name, user_facts)
         self._save()
 
     def user_name(self, chat_id: int, user_id: int) -> str | None:
         users = self.data.get("users", {})
         chat_users = users.get(str(chat_id), {}) if isinstance(users, dict) else {}
         user = chat_users.get(str(user_id), {}) if isinstance(chat_users, dict) else {}
-        profiles = self.data.get("profiles", {})
-        profile = profiles.get(str(user_id), {}) if isinstance(profiles, dict) else {}
-        if self.is_private_chat(chat_id) and isinstance(profile, dict):
-            name = profile.get("name")
-            if isinstance(name, str) and name.strip():
-                return name.strip()
         if isinstance(user, dict):
             name = user.get("name")
             if isinstance(name, str) and name.strip():
                 return name.strip()
-        if isinstance(profile, dict):
-            name = profile.get("name")
-            if isinstance(name, str) and name.strip():
-                return name.strip()
+        if self.is_private_chat(chat_id):
+            for stored_chat_id, chat_users in (
+                users.items() if isinstance(users, dict) else ()
+            ):
+                if self.is_private_chat(int(stored_chat_id)) or str(stored_chat_id) == str(chat_id):
+                    continue
+                other_user = chat_users.get(str(user_id), {}) if isinstance(chat_users, dict) else {}
+                if isinstance(other_user, dict):
+                    name = other_user.get("name")
+                    if isinstance(name, str) and name.strip():
+                        return name.strip()
         return None
 
     def remember_user(
         self, chat_id: int, user_id: int, user_name: str, chat_type: str | None
     ) -> None:
-        """Remember a Telegram name locally and in shared profiles only for public chats."""
+        """Remember a Telegram name only in the current chat memory."""
 
         users = self.data.setdefault("users", {})
         if not isinstance(users, dict):
@@ -608,16 +555,6 @@ class MemoryStore:
             user["name"] = user_name
             changed = True
         self.set_chat_type(chat_id, chat_type)
-        if chat_type in {"group", "supergroup", "channel"}:
-            profiles = self.data.setdefault("profiles", {})
-            if not isinstance(profiles, dict):
-                self.data["profiles"] = profiles = {}
-            profile = profiles.setdefault(str(user_id), {})
-            if isinstance(profile, dict):
-                self._normalize_scope(profile)
-                if user_name and not profile.get("name"):
-                    profile["name"] = user_name
-                    changed = True
         if changed:
             self._save()
 
@@ -647,13 +584,38 @@ class MemoryStore:
         blocks: list[str] = []
         if isinstance(user, dict):
             name = user.get("name") or str(user_id)
-            blocks.extend(self._scope_context(user, f"{name} personal in this chat"))
-        profiles = self.data.get("profiles", {})
-        profile = profiles.get(str(user_id), {}) if isinstance(profiles, dict) else {}
-        if isinstance(profile, dict):
-            name = profile.get("name") or str(user_id)
-            blocks.extend(self._scope_context(profile, f"{name} shared profile"))
+            blocks.extend(self._scope_context(user, f"{name} personal memory in this chat"))
+        if self.is_private_chat(chat_id):
+            blocks.extend(self.shared_user_context(user_id, exclude_chat_id=chat_id))
         return "\n\n".join(blocks)
+
+    def shared_user_context(self, user_id: int, exclude_chat_id: int | None = None) -> list[str]:
+        """Return separate memories for this user from every non-private chat."""
+
+        users = self.data.get("users", {})
+        if not isinstance(users, dict):
+            return []
+        blocks: list[str] = []
+        for stored_chat_id, chat_users in users.items():
+            try:
+                source_chat_id = int(stored_chat_id)
+            except (TypeError, ValueError):
+                continue
+            if self.is_private_chat(source_chat_id) or source_chat_id == exclude_chat_id:
+                continue
+            if not isinstance(chat_users, dict):
+                continue
+            user = chat_users.get(str(user_id), {})
+            if not isinstance(user, dict):
+                continue
+            name = user.get("name") or str(user_id)
+            blocks.extend(
+                self._scope_context(
+                    user,
+                    f'{name} memory from shared chat {source_chat_id}',
+                )
+            )
+        return blocks
 
     def context(self, chat_id: int, exclude_user_id: int | None = None) -> str:
         chats = self.data.get("chats", {})
@@ -670,10 +632,6 @@ class MemoryStore:
                     continue
                 name = user.get("name") or stored_user_id
                 blocks.extend(self._scope_context(user, f"{name} personal"))
-                profiles = self.data.get("profiles", {})
-                profile = profiles.get(str(stored_user_id), {}) if isinstance(profiles, dict) else {}
-                if isinstance(profile, dict):
-                    blocks.extend(self._scope_context(profile, f"{name} shared profile"))
         return "\n\n".join(blocks)
 
     def memory_snapshot(self, chat_id: int) -> str:
@@ -702,18 +660,32 @@ class MemoryStore:
                     for fact in self._facts(user, bucket):
                         lines.append(f"USER_{bucket.upper()}_FACT: {fact}")
 
-            profiles = self.data.get("profiles", {})
-            if isinstance(profiles, dict):
-                lines.append("SHARED USER PROFILES:")
-                for stored_user_id in chat_users:
-                    profile = profiles.get(str(stored_user_id), {})
-                    if not isinstance(profile, dict):
-                        continue
-                    name = str(profile.get("name") or "").strip()
-                    lines.append(f"PROFILE: {stored_user_id}|{name}")
-                    for bucket in ("immutable", "mutable"):
-                        for fact in self._facts(profile, bucket):
-                            lines.append(f"PROFILE_{bucket.upper()}_FACT: {fact}")
+            if self.is_private_chat(chat_id):
+                users_by_chat = self.data.get("users", {})
+                if isinstance(users_by_chat, dict):
+                    lines.append("SHARED CHAT MEMORIES (REFERENCE ONLY; KEEP SEPARATE):")
+                    for stored_chat_id, source_users in users_by_chat.items():
+                        try:
+                            source_chat_id = int(stored_chat_id)
+                        except (TypeError, ValueError):
+                            continue
+                        if self.is_private_chat(source_chat_id) or source_chat_id == chat_id:
+                            continue
+                        if not isinstance(source_users, dict):
+                            continue
+                        for stored_user_id in chat_users:
+                            source_user = source_users.get(str(stored_user_id), {})
+                            if not isinstance(source_user, dict):
+                                continue
+                            name = str(source_user.get("name") or "").strip()
+                            lines.append(
+                                f"SHARED_CHAT_USER: {source_chat_id}|{stored_user_id}|{name}"
+                            )
+                            for bucket in ("immutable", "mutable"):
+                                for fact in self._facts(source_user, bucket):
+                                    lines.append(
+                                        f"SHARED_CHAT_{bucket.upper()}_FACT: {fact}"
+                                    )
 
         return "\n".join(lines) if lines else "EMPTY"
 
@@ -768,19 +740,6 @@ class MemoryStore:
             mutable_user = user["mutable"]
             if isinstance(mutable_user, dict):
                 self._add_facts(mutable_user, info.get("facts"))
-
-        # Public chat facts become part of the cross-chat profile index.
-        # Private-chat facts deliberately stay inside that private chat.
-        if not self.is_private_chat(chat_id):
-            for stored_user_id, user in chat_users.items():
-                if not isinstance(user, dict):
-                    continue
-                self._sync_shared_profile(
-                    str(stored_user_id),
-                    user.get("name"),
-                    self._facts(user, "mutable"),
-                    self._facts(user, "immutable"),
-                )
 
         self._save()
 
