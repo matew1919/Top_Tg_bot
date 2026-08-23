@@ -156,9 +156,11 @@ class Settings:
             memory_max_tokens=max(64, integer("memory_max_tokens", 150)),
             memory_prompt=text(
                 "memory_prompt",
-                "Extract durable facts only. Return plain text, never JSON or Markdown. "
-                "One fact per line: CHAT_FACT: fact or USER_FACT: user_id|name|fact. "
-                "If none, return EMPTY.",
+                "Изучи CURRENT MEMORY и FULL CONVERSATION HISTORY. Верни полную "
+                "обновлённую память по чату и всем пользователям. Сохрани все факты "
+                "из текущей памяти. Добавь новые факты. Не удаляй факт, если он не "
+                "упомянут в истории. Верни только строки CHAT_FACT: факт или "
+                "USER_FACT: user_id|name|факт. Если фактов нет, верни EMPTY.",
             ),
             max_english_history_messages=max(1, integer("max_english_history_messages", 1)),
             reminders_file=text("reminders_file", "reminders.json") or "reminders.json",
@@ -430,6 +432,88 @@ class MemoryStore:
                 blocks.extend(self._scope_context(user, f"{name} personal"))
         return "\n\n".join(blocks)
 
+    def memory_snapshot(self, chat_id: int) -> str:
+        """Return the complete current memory for the memory-rewrite request."""
+
+        chats = self.data.get("chats", {})
+        users = self.data.get("users", {})
+        chat = chats.get(str(chat_id), {}) if isinstance(chats, dict) else {}
+        chat_users = users.get(str(chat_id), {}) if isinstance(users, dict) else {}
+        lines: list[str] = []
+
+        if isinstance(chat, dict):
+            lines.append("CHAT MEMORY:")
+            for bucket in ("immutable", "mutable"):
+                for fact in self._facts(chat, bucket):
+                    lines.append(f"CHAT_{bucket.upper()}_FACT: {fact}")
+
+        if isinstance(chat_users, dict):
+            lines.append("USER MEMORY:")
+            for stored_user_id, user in chat_users.items():
+                if not isinstance(user, dict):
+                    continue
+                name = str(user.get("name") or "").strip()
+                lines.append(f"USER: {stored_user_id}|{name}")
+                for bucket in ("immutable", "mutable"):
+                    for fact in self._facts(user, bucket):
+                        lines.append(f"USER_{bucket.upper()}_FACT: {fact}")
+
+        return "\n".join(lines) if lines else "EMPTY"
+
+    def rewrite_from_extracted(self, chat_id: int, extracted: dict[str, object]) -> None:
+        """Rewrite model-managed memory while preserving facts omitted by the model."""
+
+        chats = self.data.setdefault("chats", {})
+        users = self.data.setdefault("users", {})
+        chat = chats.setdefault(str(chat_id), {})
+        if isinstance(chat, dict):
+            self._normalize_scope(chat)
+            mutable_chat = chat["mutable"]
+            if isinstance(mutable_chat, dict):
+                old_facts = self._facts(chat, "mutable")
+                new_facts = extracted.get("chat_facts", [])
+                mutable_chat["facts"] = []
+                self._add_facts(mutable_chat, old_facts)
+                self._add_facts(mutable_chat, new_facts)
+
+        chat_users = users.setdefault(str(chat_id), {})
+        extracted_users = extracted.get("users", {})
+        if not isinstance(chat_users, dict) or not isinstance(extracted_users, dict):
+            self._save()
+            return
+
+        # Existing users and their facts remain even if the model omitted them.
+        for stored_user_id, user in list(chat_users.items()):
+            if not isinstance(user, dict):
+                continue
+            self._normalize_scope(user)
+            old_facts = self._facts(user, "mutable")
+            info = extracted_users.get(str(stored_user_id), {})
+            if not isinstance(info, dict):
+                info = {}
+            if not user.get("name") and info.get("name"):
+                user["name"] = str(info["name"]).strip()
+            mutable_user = user["mutable"]
+            if isinstance(mutable_user, dict):
+                mutable_user["facts"] = []
+                self._add_facts(mutable_user, old_facts)
+                self._add_facts(mutable_user, info.get("facts"))
+
+        for extracted_id, info in extracted_users.items():
+            if not isinstance(info, dict):
+                continue
+            user = chat_users.setdefault(str(extracted_id), {})
+            if not isinstance(user, dict):
+                continue
+            self._normalize_scope(user)
+            if not user.get("name"):
+                user["name"] = str(info.get("name") or "").strip()
+            mutable_user = user["mutable"]
+            if isinstance(mutable_user, dict):
+                self._add_facts(mutable_user, info.get("facts"))
+
+        self._save()
+
 
 class ReminderStore:
     """Persistent one-shot reminder tasks."""
@@ -656,7 +740,7 @@ class ReplyService:
                 api_key=settings.vsegpt_api_key,
                 base_url=settings.vsegpt_base_url,
                 timeout=settings.gigachat_timeout,
-                max_retries=settings.gigachat_max_retries,
+                max_retries=0,
             )
             if settings.ai_provider == "vsegpt" and settings.vsegpt_api_key
             else None
@@ -664,6 +748,38 @@ class ReplyService:
         self.history: dict[tuple[int, str], list[dict[str, object]]] = {}
         self.compacted_history: set[tuple[int, str]] = set()
         self.memory = MemoryStore(settings.memory_file)
+
+    @staticmethod
+    def _is_retryable_api_error(error: Exception) -> bool:
+        status_code = getattr(error, "status_code", None)
+        return (
+            status_code is None
+            or status_code in {408, 409, 429}
+            or (isinstance(status_code, int) and status_code >= 500)
+        )
+
+    async def _vsegpt_chat(self, **kwargs: object):
+        """Call VseGPT with bounded retries for network and server failures."""
+
+        attempts = max(1, self.settings.gigachat_max_retries + 1)
+        for attempt in range(attempts):
+            try:
+                return await asyncio.to_thread(
+                    self.vsegpt_client.chat.completions.create,
+                    **kwargs,
+                )
+            except Exception as error:
+                if attempt + 1 >= attempts or not self._is_retryable_api_error(error):
+                    raise
+                delay = min(8.0, 0.75 * (2**attempt))
+                LOGGER.warning(
+                    "VseGPT request failed (%s/%s): %s; retrying in %.2fs",
+                    attempt + 1,
+                    attempts,
+                    error,
+                    delay,
+                )
+                await asyncio.sleep(delay)
 
     def _api_messages(
         self, key: tuple[int, str], messages: list[dict[str, object]]
@@ -699,10 +815,11 @@ class ReplyService:
             )
         if assistants:
             compacted.append(
+                
                 {
                     "role": "assistant",
-                    "content": "Previous assistant reply for context only:\n"
-                    + str(assistants[-1]["content"]),
+                    "content": "Previous assistant replies for context only:\n"
+                    + "\n---\n".join(str(item["content"]) for item in assistants[-2:]),
                 }
             )
         compacted.append({"role": "user", "content": format_message(latest_user)})
@@ -744,19 +861,17 @@ class ReplyService:
     async def _extract_memory(
         self,
         chat_id: int,
-        user_id: int,
-        user_name: str,
-        old_messages: list[dict[str, object]],
+        messages: list[dict[str, object]],
     ) -> bool:
-        if not old_messages:
+        if not messages:
             return True
         LOGGER.info(
-            "Extracting memory for chat %s from %s messages",
+            "Rewriting memory for chat %s from full context (%s messages)",
             chat_id,
-            len(old_messages),
+            len(messages),
         )
         transcript_parts: list[str] = []
-        for item in old_messages:
+        for item in messages:
             if item.get("role") == "user":
                 name = str(item.get("user_name") or item.get("user_id") or "пользователь")
                 name = name.replace('"', "'").strip() or "пользователь"
@@ -766,11 +881,20 @@ class ReplyService:
             else:
                 transcript_parts.append(f'Бот ответил: {item["content"]}')
         transcript = "\n".join(transcript_parts)
+        memory_snapshot = self.memory.memory_snapshot(chat_id)
         extractor_system = self.settings.memory_prompt
         try:
             request = [
                 {"role": "system", "content": extractor_system},
-                {"role": "user", "content": transcript},
+                {
+                    "role": "user",
+                    "content": (
+                        "CURRENT MEMORY:\n"
+                        + memory_snapshot
+                        + "\n\nFULL CONVERSATION HISTORY:\n"
+                        + transcript
+                    ),
+                },
             ]
             if self.settings.ai_provider == "gigachat":
                 response = await asyncio.to_thread(
@@ -782,8 +906,7 @@ class ReplyService:
                 parts = response.messages[0].content or []
                 raw = parts if isinstance(parts, str) else "".join(part.text or "" for part in parts)
             else:
-                response = await asyncio.to_thread(
-                    self.vsegpt_client.chat.completions.create,
+                response = await self._vsegpt_chat(
                     model=self.settings.vsegpt_model,
                     messages=request,
                     max_tokens=self.settings.memory_max_tokens,
@@ -800,14 +923,8 @@ class ReplyService:
                     str(raw)[:300],
                 )
                 return False
-            self.memory.merge(
-                chat_id,
-                user_id,
-                user_name,
-                extracted.get("chat_facts", []),
-                extracted.get("users", {}),
-            )
-            LOGGER.info("Memory saved for chat %s", chat_id)
+            self.memory.rewrite_from_extracted(chat_id, extracted)
+            LOGGER.info("Full memory rewritten for chat %s", chat_id)
             return True
         except Exception:
             LOGGER.exception("Memory extraction failed")
@@ -834,6 +951,7 @@ class ReplyService:
             messages[:] = messages[-history_limit:]
             return messages
 
+        hard_compaction_failed = False
         if len(messages) >= self.settings.hard_context_limit:
             LOGGER.info(
                 "Hard context limit reached for chat %s, mode %s (%s entries)",
@@ -842,26 +960,31 @@ class ReplyService:
                 len(messages),
             )
             keep = min(self.settings.keep_last_messages, len(messages))
-            if await self._extract_memory(chat_id, user_id, user_name, messages[:-keep]):
+            if await self._extract_memory(chat_id, messages):
                 messages[:] = messages[-keep:]
                 self.compacted_history.discard((chat_id, mode))
                 LOGGER.info("Hard context compaction completed for chat %s", chat_id)
             else:
+                hard_compaction_failed = True
                 LOGGER.warning(
                     "Hard context compaction skipped for chat %s because memory extraction failed",
                     chat_id,
                 )
 
-        if len(messages) >= self.settings.soft_context_limit:
+        assistant_messages = [item for item in messages if item.get("role") == "assistant"]
+        if not hard_compaction_failed and len(assistant_messages) >= self.settings.soft_context_limit:
             LOGGER.info(
-                "Soft context compaction for chat %s, mode %s (%s entries)",
+                "Soft context compaction for chat %s, mode %s (%s assistant entries)",
                 chat_id,
                 mode,
-                len(messages),
+                len(assistant_messages),
             )
-            user_messages = [item for item in messages if item.get("role") == "user"]
-            assistant_messages = [item for item in messages if item.get("role") == "assistant"]
-            messages[:] = user_messages + (assistant_messages[-1:] if assistant_messages else [])
+            keep_assistant_ids = {id(item) for item in assistant_messages[-2:]}
+            messages[:] = [
+                item
+                for item in messages
+                if item.get("role") == "user" or id(item) in keep_assistant_ids
+            ]
             self.compacted_history.add((chat_id, mode))
         return messages
 
@@ -885,8 +1008,6 @@ class ReplyService:
 
         try:
             system_message = self.settings.english_coach_prompt if mode == "english_coach" else self.settings.system_prompt
-            if mode != "english_coach":
-                system_message += " Answer only the latest user message. Treat earlier messages as context. Follow these rules exactly."
             request_messages = [
                 {"role": "system", "content": system_message},
                 *self._api_messages((chat_id, mode), messages),
@@ -919,8 +1040,7 @@ class ReplyService:
                 parts = response.messages[0].content or []
                 answer = "".join(part.text or "" for part in parts).strip()
             else:
-                response = await asyncio.to_thread(
-                    self.vsegpt_client.chat.completions.create,
+                response = await self._vsegpt_chat(
                     model=self.settings.vsegpt_model,
                     messages=request_messages,
                     max_tokens=self.settings.vsegpt_max_tokens,
@@ -996,8 +1116,7 @@ class ReplyService:
                 parts = response.messages[0].content or []
                 raw = parts if isinstance(parts, str) else "".join(part.text or "" for part in parts)
             else:
-                response = await asyncio.to_thread(
-                    self.vsegpt_client.chat.completions.create,
+                response = await self._vsegpt_chat(
                     model=self.settings.vsegpt_model,
                     messages=request,
                     max_tokens=min(self.settings.vsegpt_max_tokens, 100),
@@ -1035,8 +1154,7 @@ class ReplyService:
                 parts = response.messages[0].content or []
                 answer = parts if isinstance(parts, str) else "".join(part.text or "" for part in parts)
             else:
-                response = await asyncio.to_thread(
-                    self.vsegpt_client.chat.completions.create,
+                response = await self._vsegpt_chat(
                     model=self.settings.vsegpt_model,
                     messages=request,
                     max_tokens=min(self.settings.vsegpt_max_tokens, 80),
@@ -1056,8 +1174,7 @@ class ReplyService:
             return "Для анализа изображений выберите AI_PROVIDER=vsegpt и добавьте VSEGPT_API_KEY."
         data_url = "data:image/jpeg;base64," + b64encode(image_bytes).decode("ascii")
         try:
-            response = await asyncio.to_thread(
-                self.vsegpt_client.chat.completions.create,
+            response = await self._vsegpt_chat(
                 model=self.settings.vsegpt_vision_model,
                 messages=[
                     {"role": "system", "content": self.settings.vision_prompt},
