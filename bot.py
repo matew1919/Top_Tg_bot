@@ -815,6 +815,7 @@ class ReplyService:
             )
         if assistants:
             compacted.append(
+                
                 {
                     "role": "assistant",
                     "content": "Previous assistant replies for context only:\n"
@@ -1007,8 +1008,6 @@ class ReplyService:
 
         try:
             system_message = self.settings.english_coach_prompt if mode == "english_coach" else self.settings.system_prompt
-            if mode != "english_coach":
-                system_message += " Answer only the latest user message. Treat earlier messages as context. Follow these rules exactly."
             request_messages = [
                 {"role": "system", "content": system_message},
                 *self._api_messages((chat_id, mode), messages),
