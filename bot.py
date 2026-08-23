@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 from gigachat import GigaChat
 from openai import OpenAI
 from telegram import Message, Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -266,6 +267,32 @@ def timezone_now(timezone_name: str) -> datetime:
         LOGGER.warning("Timezone data unavailable for %s; using fixed Europe/Moscow UTC+3", timezone_name)
         timezone = dt_timezone(timedelta(hours=3), name="MSK")
     return datetime.now(timezone)
+
+
+async def _typing_loop(bot: object, chat_id: int) -> None:
+    """Keep Telegram's typing indicator visible during a slow API request."""
+
+    try:
+        while True:
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            except Exception:
+                LOGGER.debug("Could not send typing status", exc_info=True)
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        raise
+
+
+async def run_with_typing(bot: object, chat_id: int, operation):
+    typing_task = asyncio.create_task(_typing_loop(bot, chat_id))
+    try:
+        return await operation
+    finally:
+        typing_task.cancel()
+        try:
+            await typing_task
+        except asyncio.CancelledError:
+            pass
 
 
 class ApiJournal:
@@ -1530,9 +1557,13 @@ async def reminder_loop(application: Application) -> None:
             for reminder in store.claim_due(now):
                 reminder_id = str(reminder.get("id", ""))
                 try:
-                    generated = await service.reminder_text(
-                        str(reminder.get("text", "")),
+                    generated = await run_with_typing(
+                        application.bot,
                         int(reminder["chat_id"]),
+                        service.reminder_text(
+                            str(reminder.get("text", "")),
+                            int(reminder["chat_id"]),
+                        ),
                     )
                     if not generated:
                         raise RuntimeError("Reminder model returned an empty response")
@@ -1644,7 +1675,11 @@ async def handle_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     service: ReplyService = context.application.bot_data["reply_service"]
     now = timezone_now(service.settings.timezone)
-    parsed = await service.resolve_reminder(message.text, now, chat.id)
+    parsed = await run_with_typing(
+        context.bot,
+        chat.id,
+        service.resolve_reminder(message.text, now, chat.id),
+    )
     if parsed is None:
         await message.reply_text(
             "Не смог понять время. Напиши, например: /н напомни завтра вечером купить продукты"
@@ -1720,13 +1755,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     sender = message.from_user
     user_id = sender.id if sender else 0
     user_name = (sender.full_name or sender.username or str(user_id)) if sender else "unknown"
-    answer = await service.reply(
+    answer = await run_with_typing(
+        context.bot,
         update.effective_chat.id,
-        user_id,
-        user_name,
-        prompt,
-        mode,
-        update.effective_chat.type,
+        service.reply(
+            update.effective_chat.id,
+            user_id,
+            user_name,
+            prompt,
+            mode,
+            update.effective_chat.type,
+        ),
     )
     await message.reply_text(answer)
 
@@ -1763,11 +1802,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if sender
         else None
     ) or (str(sender.id) if sender else "пользователь")
-    answer = await service.analyze_image(
-        image_bytes,
-        prompt,
-        speaker_name,
+    answer = await run_with_typing(
+        context.bot,
         update.effective_chat.id,
+        service.analyze_image(
+            image_bytes,
+            prompt,
+            speaker_name,
+            update.effective_chat.id,
+        ),
     )
     await message.reply_text(answer)
 
