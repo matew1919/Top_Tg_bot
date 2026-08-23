@@ -82,6 +82,7 @@ class Settings:
     soft_context_limit: int
     hard_context_limit: int
     keep_last_messages: int
+    context_history_file: str
     memory_file: str
     memory_max_tokens: int
     memory_prompt: str
@@ -163,6 +164,8 @@ class Settings:
             soft_context_limit=max(2, integer("soft_context_limit", 8)),
             hard_context_limit=max(3, integer("hard_context_limit", 20)),
             keep_last_messages=max(1, integer("keep_last_messages", 2)),
+            context_history_file=text("context_history_file", "context_history.json")
+            or "context_history.json",
             memory_file=text("memory_file", "memory.json") or "memory.json",
             memory_max_tokens=max(64, integer("memory_max_tokens", 150)),
             memory_prompt=text(
@@ -375,6 +378,82 @@ class ApiJournal:
             if len(entries) >= limit:
                 break
         return entries
+
+
+class ContextHistoryStore:
+    """Persist the active per-chat conversation context across restarts."""
+
+    def __init__(self, filename: str) -> None:
+        self.path = project_path(filename)
+        self._lock = threading.Lock()
+        LOGGER.info("Context history file: %s", self.path)
+
+    def load(self) -> tuple[dict[tuple[int, str], list[dict[str, object]]], set[tuple[int, str]]]:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}, set()
+        except (OSError, json.JSONDecodeError):
+            LOGGER.warning("Could not load context history %s; starting empty", self.path)
+            return {}, set()
+
+        conversations = raw.get("conversations", []) if isinstance(raw, dict) else []
+        if not isinstance(conversations, list):
+            return {}, set()
+
+        history: dict[tuple[int, str], list[dict[str, object]]] = {}
+        compacted: set[tuple[int, str]] = set()
+        for item in conversations:
+            if not isinstance(item, dict):
+                continue
+            chat_id, mode, messages = item.get("chat_id"), item.get("mode"), item.get("messages")
+            if not isinstance(chat_id, int) or not isinstance(mode, str) or not isinstance(messages, list):
+                continue
+            cleaned: list[dict[str, object]] = []
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                role, content = message.get("role"), message.get("content")
+                if role not in {"user", "assistant"} or not isinstance(content, str):
+                    continue
+                restored: dict[str, object] = {"role": role, "content": content}
+                if role == "user":
+                    if isinstance(message.get("user_id"), int):
+                        restored["user_id"] = message["user_id"]
+                    if isinstance(message.get("user_name"), str):
+                        restored["user_name"] = message["user_name"]
+                cleaned.append(restored)
+            if cleaned:
+                key = (chat_id, mode)
+                history[key] = cleaned
+                if item.get("compacted") is True:
+                    compacted.add(key)
+        return history, compacted
+
+    def save(
+        self,
+        history: dict[tuple[int, str], list[dict[str, object]]],
+        compacted_history: set[tuple[int, str]],
+    ) -> None:
+        conversations = [
+            {
+                "chat_id": chat_id,
+                "mode": mode,
+                "messages": messages,
+                "compacted": (chat_id, mode) in compacted_history,
+            }
+            for (chat_id, mode), messages in history.items()
+            if messages
+        ]
+        serialized = json.dumps({"version": 1, "conversations": conversations}, ensure_ascii=False, indent=2)
+        temporary_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        with self._lock:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                temporary_path.write_text(serialized, encoding="utf-8")
+                temporary_path.replace(self.path)
+            except OSError:
+                LOGGER.exception("Could not save context history %s", self.path)
 
 
 class MemoryStore:
@@ -1001,14 +1080,17 @@ class ReplyService:
             if settings.ai_provider == "vsegpt" and settings.vsegpt_api_key
             else None
         )
-        self.history: dict[tuple[int, str], list[dict[str, object]]] = {}
-        self.compacted_history: set[tuple[int, str]] = set()
+        self.history_store = ContextHistoryStore(settings.context_history_file)
+        self.history, self.compacted_history = self.history_store.load()
         self.memory = MemoryStore(settings.memory_file)
         self.journal = ApiJournal(
             settings.api_journal_file,
             settings.api_journal_max_entries,
             settings.api_journal_enabled,
         )
+
+    def _save_history(self) -> None:
+        self.history_store.save(self.history, self.compacted_history)
 
     @staticmethod
     def _is_retryable_api_error(error: Exception) -> bool:
@@ -1267,8 +1349,10 @@ class ReplyService:
         messages.append(
             {"role": "user", "content": text, "user_id": user_id, "user_name": user_name}
         )
+        self._save_history()
         if mode == "english_coach":
             messages[:] = messages[-history_limit:]
+            self._save_history()
             return messages
 
         hard_compaction_failed = False
@@ -1306,6 +1390,7 @@ class ReplyService:
                 if item.get("role") == "user" or id(item) in keep_assistant_ids
             ]
             self.compacted_history.add((chat_id, mode))
+        self._save_history()
         return messages
 
     async def reply(
@@ -1387,6 +1472,7 @@ class ReplyService:
             messages.append({"role": "assistant", "content": answer})
             if mode == "english_coach":
                 messages[:] = messages[-self.settings.max_english_history_messages :]
+            self._save_history()
             return answer
         return "Модель вернула пустой ответ. Попробуйте ещё раз."
 
