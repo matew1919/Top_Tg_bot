@@ -1678,11 +1678,13 @@ async def handle_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not message.text or not update.effective_chat:
+    chat = update.effective_chat
+    if not message or not message.text or not chat:
         return
     if message.from_user and message.from_user.is_bot:
         return
-    if ends_with_period(message.text):
+    is_private_chat = chat.type == "private"
+    if not is_private_chat and ends_with_period(message.text):
         return
     if contains_excluded_mention(message.text):
         return
@@ -1700,7 +1702,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     is_english = contains_english(message.text)
     is_question_trigger = question_trigger(message.text)
-    if not is_mentioned and not is_question_trigger and not is_english:
+    if not is_private_chat and not is_mentioned and not is_question_trigger and not is_english:
         return
 
     prompt = remove_bot_mention(message.text, bot_username)
@@ -1710,7 +1712,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     service: ReplyService = context.application.bot_data["reply_service"]
     # An explicit @ mention or ?? prefix selects the general assistant mode.
     # English coaching is used only for an unad dressed English message.
-    mode = "general" if is_mentioned or is_question_trigger else "english_coach"
+    mode = (
+        "general"
+        if is_mentioned or is_question_trigger or (is_private_chat and not is_english)
+        else "english_coach"
+    )
     sender = message.from_user
     user_id = sender.id if sender else 0
     user_name = (sender.full_name or sender.username or str(user_id)) if sender else "unknown"
