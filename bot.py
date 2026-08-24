@@ -16,6 +16,7 @@ import os
 import re
 import asyncio
 import json
+import socket
 import threading
 from base64 import b64encode
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from gigachat import GigaChat
 from openai import OpenAI
 from telegram import Message, Update
 from telegram.constants import ChatAction
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -38,9 +40,20 @@ from telegram.ext import (
     filters,
 )
 
+from tools_registry import ToolContext, ToolRegistry, register_builtin_tools
+
 
 LOGGER = logging.getLogger(__name__)
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+MAX_TOOL_ROUNDS = 6
+BOT_INSTANCE_LOCK_PORT = 47653
+TOOL_SYSTEM_PROMPT = """Дополнительные правила использования инструментов:
+- Используй create_reminder, когда пользователь просит поставить или создать напоминание. Передай в request полный исходный смысл запроса вместе со временем и текстом.
+- Используй web_search, когда для ответа нужны актуальные сведения из интернета или проверка факта, или например пользователь спрашивает что то, что могло изменится, например недавний фильм, или меняющийся факт.
+- Не утверждай, что инструмент сработал, пока не получил успешный результат.
+- После результата инструмента дай пользователю обычный естественный ответ. Не показывай служебный JSON и внутренние рассуждения.
+Текущее локальное время: {current_time}
+Часовой пояс пользователя: {timezone}"""
 
 
 def load_runtime_config() -> dict[str, object]:
@@ -77,6 +90,7 @@ class Settings:
     vsegpt_vision_model: str
     vision_prompt: str
     telegram_timeout: float
+    telegram_proxy_url: str | None
     system_prompt: str
     english_coach_prompt: str
     soft_context_limit: int
@@ -127,6 +141,7 @@ class Settings:
         if provider not in {"gigachat", "vsegpt"}:
             raise RuntimeError("AI_PROVIDER must be either 'gigachat' or 'vsegpt'")
         vsegpt_api_key = os.getenv("VSEGPT_API_KEY", "").strip() or None
+        telegram_proxy_url = text("telegram_proxy_url", "").strip() or None
 
         return cls(
             telegram_token=token,
@@ -153,6 +168,7 @@ class Settings:
                 "vision_prompt", "Reply briefly in Russian like in a messenger. Do not use Markdown."
             ),
             telegram_timeout=number("telegram_timeout", 30),
+            telegram_proxy_url=telegram_proxy_url,
             system_prompt=text(
                 "system_prompt",
                 "Ты полезный ассистент в Telegram-чате. Отвечай кратко и по делу на русском языке.",
@@ -1054,8 +1070,9 @@ def parse_reminder(text: str, now: datetime) -> tuple[datetime, str] | None:
 
 
 class ReplyService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, reminder_store: ReminderStore) -> None:
         self.settings = settings
+        self.reminder_store = reminder_store
         self.gigachat_client = (
             GigaChat(
                 credentials=settings.gigachat_credentials,
@@ -1087,6 +1104,12 @@ class ReplyService:
             settings.api_journal_file,
             settings.api_journal_max_entries,
             settings.api_journal_enabled,
+        )
+        self.tools = ToolRegistry()
+        register_builtin_tools(
+            self.tools,
+            self._create_reminder_tool,
+            search_proxy=settings.telegram_proxy_url,
         )
 
     def _save_history(self) -> None:
@@ -1179,6 +1202,134 @@ class ReplyService:
                     delay,
                 )
                 await asyncio.sleep(delay)
+
+    async def create_reminder(
+        self,
+        request: str,
+        chat_id: int,
+        user_id: int,
+        user_name: str,
+    ) -> dict[str, object] | None:
+        """Create a reminder through the existing parser and JSON store."""
+
+        parsed = await self.resolve_reminder(
+            request,
+            timezone_now(self.settings.timezone),
+            chat_id,
+        )
+        if parsed is None:
+            return None
+        due_at, reminder_text = parsed
+        if not reminder_text:
+            return None
+        return self.reminder_store.add(
+            chat_id,
+            user_id,
+            user_name,
+            due_at,
+            reminder_text,
+        )
+
+    async def _create_reminder_tool(
+        self,
+        arguments: dict[str, object],
+        context: ToolContext,
+    ) -> dict[str, object]:
+        request = str(arguments.get("request") or "").strip()
+        if not request:
+            return {"ok": False, "error": "Не указан текст запроса напоминания."}
+        reminder = await self.create_reminder(
+            request,
+            context.chat_id,
+            context.user_id,
+            context.user_name,
+        )
+        if reminder is None:
+            return {
+                "ok": False,
+                "error": "Не удалось определить время или текст напоминания.",
+            }
+        due_at = datetime.fromisoformat(str(reminder["due_at"]))
+        return {
+            "ok": True,
+            "reminder_id": reminder["id"],
+            "text": reminder["text"],
+            "scheduled_for": due_at.isoformat(),
+            "scheduled_for_display": due_at.strftime("%d.%m.%Y %H:%M"),
+            "timezone": context.timezone,
+        }
+
+    async def _vsegpt_reply_with_tools(
+        self,
+        request_messages: list[dict[str, object]],
+        context: ToolContext,
+    ) -> str:
+        """Run native function calling until the model returns a text answer."""
+
+        base_system_prompt = str(request_messages[0].get("content") or "")
+        conversation = [dict(message) for message in request_messages[1:]]
+        for _ in range(MAX_TOOL_ROUNDS):
+            now = timezone_now(context.timezone)
+            tool_prompt = TOOL_SYSTEM_PROMPT.format(
+                current_time=now.strftime("%Y-%m-%d %H:%M:%S (%Z)"),
+                timezone=context.timezone,
+            )
+            messages = [
+                {
+                    "role": "system",
+                    "content": base_system_prompt + "\n\n" + tool_prompt,
+                },
+                *conversation,
+            ]
+            response = await self._vsegpt_chat(
+                model=self.settings.vsegpt_model,
+                messages=messages,
+                tools=self.tools.schemas,
+                tool_choice="auto",
+                max_tokens=self.settings.vsegpt_max_tokens,
+                kind="reply",
+                chat_id=context.chat_id,
+            )
+            if not response.choices:
+                raise RuntimeError("VseGPT returned an empty response")
+            message = response.choices[0].message
+            tool_calls = list(message.tool_calls or [])
+            if not tool_calls:
+                return (message.content or "").strip()
+
+            serialized_calls: list[dict[str, object]] = []
+            for call in tool_calls:
+                serialized_calls.append(
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.function.name,
+                            "arguments": call.function.arguments,
+                        },
+                    }
+                )
+            conversation.append(
+                {
+                    "role": "assistant",
+                    "content": message.content or None,
+                    "tool_calls": serialized_calls,
+                }
+            )
+            for call in tool_calls:
+                result = await self.tools.execute(
+                    call.function.name,
+                    call.function.arguments,
+                    context,
+                )
+                conversation.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": result,
+                    }
+                )
+        raise RuntimeError("Tool calling exceeded the maximum number of rounds")
 
     def _api_messages(
         self, key: tuple[int, str], messages: list[dict[str, object]]
@@ -1454,16 +1605,27 @@ class ReplyService:
                 parts = response.messages[0].content or []
                 answer = "".join(part.text or "" for part in parts).strip()
             else:
-                response = await self._vsegpt_chat(
-                    model=self.settings.vsegpt_model,
-                    messages=request_messages,
-                    max_tokens=self.settings.vsegpt_max_tokens,
-                    kind="reply",
-                    chat_id=chat_id,
-                )
-                if not response.choices:
-                    raise RuntimeError("VseGPT returned an empty response")
-                answer = (response.choices[0].message.content or "").strip()
+                if mode == "general":
+                    answer = await self._vsegpt_reply_with_tools(
+                        request_messages,
+                        ToolContext(
+                            chat_id=chat_id,
+                            user_id=user_id,
+                            user_name=speaker_name,
+                            timezone=self.settings.timezone,
+                        ),
+                    )
+                else:
+                    response = await self._vsegpt_chat(
+                        model=self.settings.vsegpt_model,
+                        messages=request_messages,
+                        max_tokens=self.settings.vsegpt_max_tokens,
+                        kind="reply",
+                        chat_id=chat_id,
+                    )
+                    if not response.choices:
+                        raise RuntimeError("VseGPT returned an empty response")
+                    answer = (response.choices[0].message.content or "").strip()
         except Exception:
             LOGGER.exception("AI response failed")
             answer = "Не смог обработать сообщение. Попробуйте ещё раз позже."
@@ -1760,24 +1922,6 @@ async def handle_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     service: ReplyService = context.application.bot_data["reply_service"]
-    now = timezone_now(service.settings.timezone)
-    parsed = await run_with_typing(
-        context.bot,
-        chat.id,
-        service.resolve_reminder(message.text, now, chat.id),
-    )
-    if parsed is None:
-        await message.reply_text(
-            "Не смог понять время. Напиши, например: /н напомни завтра вечером купить продукты"
-        )
-        return
-    due_at, reminder_text = parsed
-    if not reminder_text:
-        await message.reply_text(
-            "После времени нужно написать текст напоминания. Например: /н 18:30 позвонить другу"
-        )
-        return
-
     sender = message.from_user
     user_id = sender.id if sender else 0
     if sender:
@@ -1788,8 +1932,22 @@ async def handle_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             chat.type,
         )
     speaker_name = service.memory.user_name(chat.id, user_id) or str(user_id)
-    reminder_store: ReminderStore = context.application.bot_data["reminder_store"]
-    reminder = reminder_store.add(chat.id, user_id, speaker_name, due_at, reminder_text)
+    reminder = await run_with_typing(
+        context.bot,
+        chat.id,
+        service.create_reminder(
+            message.text,
+            chat.id,
+            user_id,
+            speaker_name,
+        ),
+    )
+    if reminder is None:
+        await message.reply_text(
+            "Не смог понять время. Напиши, например: /н напомни завтра вечером купить продукты"
+        )
+        return
+    due_at = datetime.fromisoformat(str(reminder["due_at"]))
     await message.reply_text(
         "Напоминание поставлено на "
         + due_at.strftime("%d.%m.%Y %H:%M")
@@ -1905,23 +2063,33 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def build_application(settings: Settings) -> Application:
+    request_options: dict[str, object] = {
+        "connect_timeout": settings.telegram_timeout,
+        "read_timeout": settings.telegram_timeout,
+        "write_timeout": settings.telegram_timeout,
+        "pool_timeout": settings.telegram_timeout,
+    }
+    get_updates_options = {
+        **request_options,
+        "read_timeout": settings.telegram_timeout + 10,
+    }
+    if settings.telegram_proxy_url:
+        request_options["proxy"] = settings.telegram_proxy_url
+        get_updates_options["proxy"] = settings.telegram_proxy_url
+        LOGGER.info("Telegram Bot API uses proxy %s", settings.telegram_proxy_url)
+
     application = (
         ApplicationBuilder()
         .token(settings.telegram_token)
-        .connect_timeout(settings.telegram_timeout)
-        .read_timeout(settings.telegram_timeout)
-        .write_timeout(settings.telegram_timeout)
-        .pool_timeout(settings.telegram_timeout)
-        .get_updates_connect_timeout(settings.telegram_timeout)
-        .get_updates_read_timeout(settings.telegram_timeout + 10)
-        .get_updates_write_timeout(settings.telegram_timeout)
-        .get_updates_pool_timeout(settings.telegram_timeout)
+        .request(HTTPXRequest(**request_options))
+        .get_updates_request(HTTPXRequest(**get_updates_options))
         .post_init(start_background_tasks)
         .post_shutdown(stop_background_tasks)
         .build()
     )
-    application.bot_data["reply_service"] = ReplyService(settings)
-    application.bot_data["reminder_store"] = ReminderStore(settings.reminders_file)
+    reminder_store = ReminderStore(settings.reminders_file)
+    application.bot_data["reminder_store"] = reminder_store
+    application.bot_data["reply_service"] = ReplyService(settings, reminder_store)
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
@@ -1937,6 +2105,22 @@ def build_application(settings: Settings) -> Application:
     return application
 
 
+def acquire_instance_lock() -> socket.socket | None:
+    """Keep only one polling instance of this bot running on the computer."""
+
+    lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        lock.bind(("127.0.0.1", BOT_INSTANCE_LOCK_PORT))
+        lock.listen(1)
+    except OSError:
+        lock.close()
+        LOGGER.error(
+            "Another bot instance is already running. Stop it before starting bot.py again."
+        )
+        return None
+    return lock
+
+
 def main() -> None:
     load_dotenv()
     settings = Settings.from_env()
@@ -1946,6 +2130,9 @@ def main() -> None:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    instance_lock = acquire_instance_lock()
+    if instance_lock is None:
+        return
     if settings.ai_provider == "gigachat" and not settings.gigachat_credentials:
         LOGGER.warning("GIGACHAT_CREDENTIALS is not set; fallback replies will be used")
     elif settings.ai_provider == "vsegpt" and not settings.vsegpt_api_key:
