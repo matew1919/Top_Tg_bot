@@ -22,6 +22,7 @@ from base64 import b64encode
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
+from typing import Awaitable, Callable
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -1296,11 +1297,13 @@ class ReplyService:
         self,
         request_messages: list[dict[str, object]],
         context: ToolContext,
+        status_callback: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         """Run native function calling until the model returns a text answer."""
 
         base_system_prompt = str(request_messages[0].get("content") or "")
         conversation = [dict(message) for message in request_messages[1:]]
+        delivered_statuses: set[str] = set()
         for _ in range(MAX_TOOL_ROUNDS):
             now = timezone_now(context.timezone)
             tool_prompt = TOOL_SYSTEM_PROMPT.format(
@@ -1349,6 +1352,31 @@ class ReplyService:
                     "tool_calls": serialized_calls,
                 }
             )
+            if status_callback:
+                for call in tool_calls:
+                    try:
+                        raw_arguments = call.function.arguments
+                        arguments = (
+                            raw_arguments
+                            if isinstance(raw_arguments, dict)
+                            else json.loads(raw_arguments or "{}")
+                        )
+                        status_text = (
+                            str(arguments.get("status_text") or "").strip()
+                            if isinstance(arguments, dict)
+                            else ""
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        status_text = ""
+                    if not status_text or status_text in delivered_statuses:
+                        continue
+                    delivered_statuses.add(status_text)
+                    status_base = status_text.rstrip().rstrip(".…").rstrip()
+                    status_for_telegram = status_base[:297].rstrip() + "..."
+                    try:
+                        await status_callback(status_for_telegram)
+                    except Exception:
+                        LOGGER.warning("Could not send tool status message", exc_info=True)
             for call in tool_calls:
                 result = await self.tools.execute(
                     call.function.name,
@@ -1649,6 +1677,7 @@ class ReplyService:
         text: str,
         mode: str,
         chat_type: str | None = None,
+        tool_status_callback: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         if self.settings.ai_provider == "gigachat" and not self.gigachat_client:
             return (
@@ -1698,6 +1727,7 @@ class ReplyService:
                             user_name=speaker_name,
                             timezone=self.settings.timezone,
                         ),
+                        status_callback=tool_status_callback,
                     )
                 else:
                     response = await self._vsegpt_chat(
@@ -2093,6 +2123,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     sender = message.from_user
     user_id = sender.id if sender else 0
     user_name = (sender.full_name or sender.username or str(user_id)) if sender else "unknown"
+    tool_status_messages: list[Message] = []
+
+    async def send_tool_status(status_text: str) -> None:
+        status_message = await message.reply_text(status_text)
+        tool_status_messages.append(status_message)
+
     answer = await run_with_typing(
         context.bot,
         update.effective_chat.id,
@@ -2103,9 +2139,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             prompt,
             mode,
             update.effective_chat.type,
+            tool_status_callback=send_tool_status,
         ),
     )
     await message.reply_text(answer)
+    for status_message in tool_status_messages:
+        try:
+            await status_message.delete()
+        except Exception:
+            LOGGER.warning(
+                "Could not delete tool status message %s",
+                status_message.message_id,
+                exc_info=True,
+            )
 
 
 def photo_analysis_prompt(caption: str) -> str | None:

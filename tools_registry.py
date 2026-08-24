@@ -95,27 +95,38 @@ async def web_search(
     if not query:
         raise ValueError("query is required")
 
-    def search() -> list[dict[str, str]]:
-        raw_results = DDGS(proxy=proxy, timeout=10).text(
-            query,
-            max_results=5,
-            backend="brave,wikipedia",
-        )
-        results: list[dict[str, str]] = []
-        for item in raw_results or []:
-            if not isinstance(item, dict):
+    def search() -> tuple[list[dict[str, str]], str]:
+        failures: list[str] = []
+        for backend in ("brave", "duckduckgo", "google"):
+            try:
+                raw_results = DDGS(proxy=proxy, timeout=8).text(
+                    query,
+                    max_results=5,
+                    backend=backend,
+                )
+            except Exception as error:
+                failures.append(f"{backend}: {str(error) or type(error).__name__}")
                 continue
-            results.append(
-                {
-                    "title": str(item.get("title") or "").strip(),
-                    "url": str(item.get("href") or item.get("url") or "").strip(),
-                    "snippet": str(item.get("body") or item.get("snippet") or "").strip()[:1000],
-                }
-            )
-        return results
 
-    results = await asyncio.to_thread(search)
-    return {"ok": True, "query": query, "results": results}
+            results: list[dict[str, str]] = []
+            for item in raw_results or []:
+                if not isinstance(item, dict):
+                    continue
+                results.append(
+                    {
+                        "title": str(item.get("title") or "").strip(),
+                        "url": str(item.get("href") or item.get("url") or "").strip(),
+                        "snippet": str(item.get("body") or item.get("snippet") or "").strip()[:1000],
+                    }
+                )
+            if results:
+                return results, backend
+            failures.append(f"{backend}: no results")
+
+        raise RuntimeError("Search failed: " + "; ".join(failures))
+
+    results, backend = await asyncio.to_thread(search)
+    return {"ok": True, "query": query, "backend": backend, "results": results}
 
 
 def register_builtin_tools(
@@ -138,9 +149,16 @@ def register_builtin_tools(
                 "query": {
                     "type": "string",
                     "description": "A concise internet search query.",
+                },
+                "status_text": {
+                    "type": "string",
+                    "description": (
+                        "A short natural message in the user's language saying that the search "
+                        "is being performed. Do not claim that results were already found."
+                    ),
                 }
             },
-            "required": ["query"],
+            "required": ["query", "status_text"],
             "additionalProperties": False,
         },
         search_handler,
@@ -156,9 +174,16 @@ def register_builtin_tools(
                     "description": (
                         "The user's complete reminder request, including the time and what to remind about."
                     ),
+                },
+                "status_text": {
+                    "type": "string",
+                    "description": (
+                        "A short natural message in the user's language saying that the reminder "
+                        "is being created. Do not claim success before the tool returns."
+                    ),
                 }
             },
-            "required": ["request"],
+            "required": ["request", "status_text"],
             "additionalProperties": False,
         },
         create_reminder,
