@@ -2,11 +2,6 @@
 .env.example
 .venv/
 .idea/
-memory.json
-context_history.json
-context_history.json.tmp
-reminders.json
-api_journal.jsonl
 bot_autostart.log
 happ_autostart.log
 __pycache__/

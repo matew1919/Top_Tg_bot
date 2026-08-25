@@ -10,6 +10,9 @@
   "vsegpt_base_url": "https://api.vsegpt.ru/v1",
   "vsegpt_max_tokens": 200,
   "vsegpt_vision_model": "vis-google/gemini-3-flash-pre",
+  "vsegpt_multimodal_model": "google/gemini-3.1-flash-lite",
+  "vsegpt_transcription_model": "stt-openai/gpt-4o-mini-transcribe",
+  "vsegpt_min_request_interval": 2.05,
   "vision_prompt": "Reply briefly in Russian like in a messenger. Do not use Markdown.",
   "telegram_timeout": 30,
   "telegram_proxy_url": "socks5://127.0.0.1:10808",
@@ -31,5 +34,13 @@
   "log_level": "INFO",
   "api_journal_file": "api_journal.jsonl",
   "api_journal_max_entries": 200,
-  "api_journal_enabled": true
+  "api_journal_enabled": true,
+  "media_max_bytes": 19000000,
+  "media_max_duration_seconds": 600,
+  "media_max_frames": 6,
+  "media_max_transcript_chars": 12000,
+  "media_processing_timeout": 180,
+  "media_max_files_per_turn": 6,
+  "media_max_turn_bytes": 25000000,
+  "media_max_image_payload_bytes": 6000000
 }
