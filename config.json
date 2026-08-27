@@ -31,7 +31,7 @@
   "vacancy_sources": ["hh", "habr"],
   "vacancy_keywords": ["python", "django", "backend", "rest api", "django rest framework", "drf"],
   "vacancy_required_keywords": ["python"],
-  "vacancy_excluded_keywords": ["senior", "lead", "principal", "architect", "руководитель", "директор"],
+  "vacancy_excluded_keywords": ["senior", "lead", "principal", "architect", "руководитель", "директор", "аналитик", "аналитика", "analyst", "data analyst", "product analyst", "business analyst"],
   "vacancy_locations": [],
   "vacancy_remote_only": true,
   "vacancy_min_salary": 0,

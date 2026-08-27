@@ -45,7 +45,7 @@ class VacancyParserTests(unittest.IsolatedAsyncioTestCase):
         vacancy_filter = VacancyFilter(
             keywords=("python", "django", "backend", "rest api"),
             required_keywords=("python",),
-            excluded_keywords=("senior", "lead", "architect"),
+            excluded_keywords=("senior", "lead", "architect", "аналитика"),
             remote_only=True,
             min_salary=100000,
         )
@@ -66,8 +66,9 @@ class VacancyParserTests(unittest.IsolatedAsyncioTestCase):
         )
         senior = matching.__class__(**{**matching.__dict__, "title": "Senior Python Developer"})
         onsite = matching.__class__(**{**matching.__dict__, "remote": False})
+        analyst = matching.__class__(**{**matching.__dict__, "title": "SQL/Python-аналитика"})
 
-        result = filter_vacancies([matching, senior, onsite], vacancy_filter)
+        result = filter_vacancies([matching, senior, onsite, analyst], vacancy_filter)
 
         self.assertEqual([item.external_id for item in result], ["1"])
 

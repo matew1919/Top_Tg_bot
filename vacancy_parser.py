@@ -80,7 +80,10 @@ class VacancyFilter:
             return False
         if required and not all(item in haystack for item in required):
             return False
-        if excluded and any(item in haystack for item in excluded):
+        # Negative role words are most useful in the title: a backend vacancy
+        # can mention analytics in its description without being an analyst role.
+        title = vacancy.title.lower()
+        if excluded and any(item in title for item in excluded):
             return False
         if locations and not any(item in haystack for item in locations):
             return False

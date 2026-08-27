@@ -1150,6 +1150,7 @@ class VacancyService:
             f"Получатель: {target_line}\n"
             f"Источники: {', '.join(self.config.sources)}\n"
             f"Ключевые слова: {filter_line}\n"
+            f"Формат: {'только удалённо' if self.config.filter.remote_only else 'любой'}\n"
             f"Проверка: каждые {self.config.poll_seconds // 60} мин."
         )
 
@@ -2061,6 +2062,14 @@ async def _send_vacancy_messages(
     return sent
 
 
+def vacancy_check_status_text(total: int, matches: int, new_count: int) -> str:
+    if new_count:
+        result = f"Найдено новых вакансий: {new_count}."
+    else:
+        result = "Новых вакансий не найдено."
+    return f"{result}\nПроверено: {total}. Подходит под фильтр: {matches}."
+
+
 async def vacancies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     chat = update.effective_chat
@@ -2123,7 +2132,7 @@ async def vacancies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await message.reply_text("Не смог получить вакансии. Подробности есть в логе.")
         return
     if not matches:
-        await message.reply_text(f"Подходящих вакансий нет. Проверено: {total}.")
+        await message.reply_text(f"Вакансии не найдены. Проверено: {total}.")
         return
     await message.reply_text(f"Подходящих вакансий: {count}. Показываю первые 10:")
     await _send_vacancy_messages(context.bot, chat.id, matches, limit=10)
@@ -2154,8 +2163,25 @@ async def vacancy_loop(application: Application) -> None:
                                 )
                             except Exception:
                                 LOGGER.exception("Could not deliver vacancies to chat %s", chat_id)
+                    status_text = vacancy_check_status_text(total, matches, len(new_vacancies))
+                    for chat_id in chat_ids:
+                        try:
+                            await application.bot.send_message(
+                                chat_id=chat_id,
+                                text=status_text,
+                            )
+                        except Exception:
+                            LOGGER.exception("Could not deliver vacancy status to chat %s", chat_id)
                 except Exception:
                     LOGGER.exception("Vacancy polling failed")
+                    for chat_id in chat_ids:
+                        try:
+                            await application.bot.send_message(
+                                chat_id=chat_id,
+                                text="Проверка вакансий не выполнена. Подробности есть в логе.",
+                            )
+                        except Exception:
+                            LOGGER.exception("Could not deliver vacancy failure status to chat %s", chat_id)
             await asyncio.sleep(service.config.poll_seconds)
     except asyncio.CancelledError:
         LOGGER.info("Vacancy scheduler stopped")
