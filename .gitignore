@@ -6,6 +6,7 @@ memory.json
 context_history.json
 context_history.json.tmp
 reminders.json
+vacancies.json
 api_journal.jsonl
 bot_autostart.log
 happ_autostart.log

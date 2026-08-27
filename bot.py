@@ -31,6 +31,7 @@ from gigachat import GigaChat
 from openai import OpenAI
 from telegram import Message, Update
 from telegram.constants import ChatAction
+from telegram.error import BadRequest
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
@@ -42,6 +43,14 @@ from telegram.ext import (
 )
 
 from tools_registry import ToolContext, ToolRegistry, register_builtin_tools
+from vacancy_parser import (
+    VacancyConfig,
+    VacancyFilter,
+    VacancyParser,
+    VacancyStore,
+    filter_vacancies,
+    format_vacancy,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -115,6 +124,22 @@ class Settings:
     reminder_prompt: str
     timezone: str
     reminder_poll_seconds: int
+    vacancy_sources: tuple[str, ...]
+    vacancy_keywords: tuple[str, ...]
+    vacancy_required_keywords: tuple[str, ...]
+    vacancy_excluded_keywords: tuple[str, ...]
+    vacancy_locations: tuple[str, ...]
+    vacancy_remote_only: bool
+    vacancy_min_salary: int
+    vacancy_max_age_hours: int
+    vacancy_require_salary: bool
+    vacancy_poll_seconds: int
+    vacancy_per_source: int
+    vacancy_store_file: str
+    vacancy_first_run_notify: bool
+    vacancy_user_agent: str
+    vacancy_target_chat_id: int
+    vacancy_always_on: bool
     log_level: str
     api_journal_file: str
     api_journal_max_entries: int
@@ -141,6 +166,14 @@ class Settings:
             if isinstance(raw, bool):
                 return raw
             return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+        def strings(name: str, default: list[str]) -> tuple[str, ...]:
+            raw = value(name, default)
+            if isinstance(raw, str):
+                return tuple(item.strip() for item in raw.split(",") if item.strip())
+            if isinstance(raw, list):
+                return tuple(str(item).strip() for item in raw if str(item).strip())
+            return tuple(default)
 
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         if not token:
@@ -214,6 +247,25 @@ class Settings:
             ),
             timezone=text("timezone", "Europe/Moscow") or "Europe/Moscow",
             reminder_poll_seconds=max(5, integer("reminder_poll_seconds", 15)),
+            vacancy_sources=strings("vacancy_sources", ["hh", "habr"]),
+            vacancy_keywords=strings("vacancy_keywords", []),
+            vacancy_required_keywords=strings("vacancy_required_keywords", []),
+            vacancy_excluded_keywords=strings("vacancy_excluded_keywords", []),
+            vacancy_locations=strings("vacancy_locations", []),
+            vacancy_remote_only=boolean("vacancy_remote_only", False),
+            vacancy_min_salary=max(0, integer("vacancy_min_salary", 0)),
+            vacancy_max_age_hours=max(0, integer("vacancy_max_age_hours", 72)),
+            vacancy_require_salary=boolean("vacancy_require_salary", False),
+            vacancy_poll_seconds=max(300, integer("vacancy_poll_seconds", 1800)),
+            vacancy_per_source=max(1, min(100, integer("vacancy_per_source", 50))),
+            vacancy_store_file=text("vacancy_store_file", "vacancies.json") or "vacancies.json",
+            vacancy_first_run_notify=boolean("vacancy_first_run_notify", False),
+            vacancy_user_agent=text(
+                "vacancy_user_agent",
+                "TopTgBot/1.0 (vacancy parser; contact the project owner)",
+            ),
+            vacancy_target_chat_id=integer("vacancy_target_chat_id", 0),
+            vacancy_always_on=boolean("vacancy_always_on", False),
             log_level=text("log_level", "INFO").upper(),
             api_journal_file=text("api_journal_file", "api_journal.jsonl")
             or "api_journal.jsonl",
@@ -1023,6 +1075,88 @@ class ReminderStore:
                 reminder["status"] = status
                 self._save()
                 return
+
+
+class VacancyService:
+    """Fetch and locally filter vacancies without using the AI provider."""
+
+    def __init__(self, settings: Settings) -> None:
+        vacancy_filter = VacancyFilter(
+            keywords=settings.vacancy_keywords,
+            required_keywords=settings.vacancy_required_keywords,
+            excluded_keywords=settings.vacancy_excluded_keywords,
+            locations=settings.vacancy_locations,
+            remote_only=settings.vacancy_remote_only,
+            min_salary=settings.vacancy_min_salary,
+            max_age_hours=settings.vacancy_max_age_hours,
+            require_salary=settings.vacancy_require_salary,
+        )
+        vacancy_config = VacancyConfig(
+            sources=settings.vacancy_sources,
+            filter=vacancy_filter,
+            poll_seconds=settings.vacancy_poll_seconds,
+            per_source=settings.vacancy_per_source,
+            store_file=settings.vacancy_store_file,
+            first_run_notify=settings.vacancy_first_run_notify,
+            user_agent=settings.vacancy_user_agent,
+        )
+        self.settings = settings
+        self.config = vacancy_config
+        self.parser = VacancyParser(vacancy_config, settings.telegram_proxy_url)
+        self.store = VacancyStore(project_path(vacancy_config.store_file))
+        self._poll_lock = asyncio.Lock()
+
+    async def current(self) -> tuple[list[object], int, int]:
+        """Return current matches without changing the seen-vacancy store."""
+
+        async with self._poll_lock:
+            all_vacancies = await self.parser.fetch()
+            matches = filter_vacancies(all_vacancies, self.config.filter)
+            return matches, len(all_vacancies), len(matches)
+
+    async def poll(self) -> tuple[list[object], int, int]:
+        """Fetch matches and return only unseen ones."""
+
+        async with self._poll_lock:
+            all_vacancies = await self.parser.fetch()
+            matches = filter_vacancies(all_vacancies, self.config.filter)
+            unseen = [vacancy for vacancy in matches if not self.store.is_seen(vacancy.key)]
+
+            if not self.store.baseline_done and not self.config.first_run_notify:
+                # Do not flood Telegram with vacancies that existed before tracking was enabled.
+                self.store.mark_seen(vacancy.key for vacancy in matches)
+                self.store.finish_baseline()
+                unseen = []
+            else:
+                self.store.mark_seen(vacancy.key for vacancy in unseen)
+                if not self.store.baseline_done:
+                    self.store.finish_baseline()
+            return unseen, len(all_vacancies), len(matches)
+
+    def status_text(self, chat_id: int) -> str:
+        if self.settings.vacancy_target_chat_id:
+            enabled = (
+                chat_id == self.settings.vacancy_target_chat_id
+                and self.settings.vacancy_always_on
+            )
+            target_line = str(self.settings.vacancy_target_chat_id)
+        else:
+            enabled = chat_id in self.store.subscribed_chat_ids()
+            target_line = "не задан"
+        filter_items = list(self.config.filter.keywords)
+        filter_line = ", ".join(filter_items) if filter_items else "не задан — будут подходить все вакансии"
+        return (
+            f"Мониторинг: {'включён' if enabled else 'выключен'}\n"
+            f"Получатель: {target_line}\n"
+            f"Источники: {', '.join(self.config.sources)}\n"
+            f"Ключевые слова: {filter_line}\n"
+            f"Проверка: каждые {self.config.poll_seconds // 60} мин."
+        )
+
+    def notification_chat_ids(self) -> list[int]:
+        if self.settings.vacancy_target_chat_id and self.settings.vacancy_always_on:
+            return [self.settings.vacancy_target_chat_id]
+        return self.store.subscribed_chat_ids()
 
 
 def parse_reminder(text: str, now: datetime) -> tuple[datetime, str] | None:
@@ -1908,6 +2042,126 @@ class ReplyService:
             return "Не смог проанализировать изображение. Проверьте баланс и доступность vision-модели."
 
 
+async def _send_vacancy_messages(
+    bot: object,
+    chat_id: int,
+    vacancies: list[object],
+    *,
+    limit: int = 20,
+) -> int:
+    sent = 0
+    for vacancy in vacancies[:limit]:
+        await bot.send_message(chat_id=chat_id, text=format_vacancy(vacancy))
+        sent += 1
+    if len(vacancies) > limit:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"Ещё найдено вакансий: {len(vacancies) - limit}. Показываю первые {limit}.",
+        )
+    return sent
+
+
+async def vacancies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat:
+        return
+    service: VacancyService = context.application.bot_data["vacancy_service"]
+    target_chat_id = service.settings.vacancy_target_chat_id
+    if target_chat_id and chat.id != target_chat_id:
+        return
+    args = [str(item).strip().lower() for item in (context.args or [])]
+    action = args[0] if args else "check"
+
+    if action in {"on", "вкл", "включить"}:
+        vacancy_filter = service.config.filter
+        has_filter = bool(
+            vacancy_filter.keywords
+            or vacancy_filter.required_keywords
+            or vacancy_filter.excluded_keywords
+            or vacancy_filter.locations
+            or vacancy_filter.remote_only
+            or vacancy_filter.min_salary
+            or vacancy_filter.require_salary
+        )
+        if not has_filter:
+            await message.reply_text(
+                "Фильтр пока пустой. Заполни vacancy_keywords или другие vacancy_* поля "
+                "в config.json, перезапусти бота и повтори /vacancies on."
+            )
+            return
+        service.store.subscribe(chat.id)
+        try:
+            new_vacancies, total, matches = await service.poll()
+        except Exception:
+            LOGGER.exception("Manual vacancy subscription check failed")
+            await message.reply_text("Не смог проверить вакансии. Подробности есть в логе.")
+            return
+        await message.reply_text(
+            "Мониторинг включён. "
+            f"Получено: {total}, подходит под фильтр: {matches}, новых отправлено: {len(new_vacancies)}."
+        )
+        await _send_vacancy_messages(context.bot, chat.id, new_vacancies)
+        return
+
+    if action in {"off", "выкл", "выключить"}:
+        if service.settings.vacancy_target_chat_id and service.settings.vacancy_always_on:
+            await message.reply_text("Мониторинг закреплён за целевым пользователем и включён постоянно.")
+            return
+        service.store.unsubscribe(chat.id)
+        await message.reply_text("Мониторинг вакансий выключен.")
+        return
+
+    if action in {"status", "статус"}:
+        await message.reply_text(service.status_text(chat.id))
+        return
+
+    try:
+        matches, total, count = await service.current()
+    except Exception:
+        LOGGER.exception("Manual vacancy check failed")
+        await message.reply_text("Не смог получить вакансии. Подробности есть в логе.")
+        return
+    if not matches:
+        await message.reply_text(f"Подходящих вакансий нет. Проверено: {total}.")
+        return
+    await message.reply_text(f"Подходящих вакансий: {count}. Показываю первые 10:")
+    await _send_vacancy_messages(context.bot, chat.id, matches, limit=10)
+
+
+async def vacancy_loop(application: Application) -> None:
+    service: VacancyService = application.bot_data["vacancy_service"]
+    LOGGER.info("Vacancy scheduler started")
+    try:
+        while True:
+            chat_ids = service.notification_chat_ids()
+            if chat_ids:
+                try:
+                    new_vacancies, total, matches = await service.poll()
+                    if new_vacancies:
+                        LOGGER.info(
+                            "Found %s new matching vacancies (fetched %s, matched %s)",
+                            len(new_vacancies),
+                            total,
+                            matches,
+                        )
+                        for chat_id in chat_ids:
+                            try:
+                                await _send_vacancy_messages(
+                                    application.bot,
+                                    chat_id,
+                                    new_vacancies,
+                                )
+                            except Exception:
+                                LOGGER.exception("Could not deliver vacancies to chat %s", chat_id)
+                except Exception:
+                    LOGGER.exception("Vacancy polling failed")
+            await asyncio.sleep(service.config.poll_seconds)
+    except asyncio.CancelledError:
+        LOGGER.info("Vacancy scheduler stopped")
+        raise
+
+
 async def reminder_loop(application: Application) -> None:
     store: ReminderStore = application.bot_data["reminder_store"]
     service: ReplyService = application.bot_data["reply_service"]
@@ -1935,6 +2189,16 @@ async def reminder_loop(application: Application) -> None:
                     )
                     store.remove(reminder_id)
                     LOGGER.info("Reminder delivered: %s", reminder_id)
+                except BadRequest as error:
+                    if "Chat not found" in str(error):
+                        store.remove(reminder_id)
+                        LOGGER.error(
+                            "Removing undeliverable reminder %s: chat not found",
+                            reminder_id,
+                        )
+                    else:
+                        LOGGER.exception("Reminder delivery failed: %s", reminder_id)
+                        store.release(reminder_id)
                 except Exception:
                     LOGGER.exception("Reminder delivery failed: %s", reminder_id)
                     store.release(reminder_id)
@@ -1946,24 +2210,27 @@ async def reminder_loop(application: Application) -> None:
 
 async def start_background_tasks(application: Application) -> None:
     application.bot_data["reminder_task"] = asyncio.create_task(reminder_loop(application))
+    application.bot_data["vacancy_task"] = asyncio.create_task(vacancy_loop(application))
 
 
 async def stop_background_tasks(application: Application) -> None:
-    task = application.bot_data.get("reminder_task")
-    if not isinstance(task, asyncio.Task):
-        return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    for task_name in ("reminder_task", "vacancy_task"):
+        task = application.bot_data.get(task_name)
+        if not isinstance(task, asyncio.Task):
+            continue
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "Привет! Упомяните меня через @, начните сообщение с ?? или отправьте "
         "сообщение на английском языке — и я отвечу. Для анализа фото добавьте "
-        "подпись ?? ваш вопрос. Для напоминания используйте /н. Подробнее: /help"
+        "подпись ?? ваш вопрос. Для напоминания используйте /н. Для вакансий: "
+        "/vacancies. Подробнее: /help"
     )
 
 
@@ -1976,6 +2243,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Фото с подписью ?? вопрос или /analyze вопрос — анализ изображения.\n"
         "/н свободное описание времени и задачи — напоминание. Например: "
         "/н напомни завтра вечером купить продукты.\n"
+        "/vacancies — показать подходящие вакансии.\n"
+        "/vacancies on — включить автоматические уведомления.\n"
+        "/vacancies off — выключить уведомления.\n"
+        "/vacancies status — показать настройки парсера.\n"
         "/start — краткое описание.\n"
         "/help — эта справка.\n\n"
         "/log [N] — последние запросы к API в этом чате.\n\n"
@@ -2231,10 +2502,12 @@ def build_application(settings: Settings) -> Application:
     reminder_store = ReminderStore(settings.reminders_file)
     application.bot_data["reminder_store"] = reminder_store
     application.bot_data["reply_service"] = ReplyService(settings, reminder_store)
+    application.bot_data["vacancy_service"] = VacancyService(settings)
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler(["log", "journal"], api_log_command))
+    application.add_handler(CommandHandler("vacancies", vacancies_command))
     application.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(r"^\s*/н(?:@[A-Za-z0-9_]+)?(?:\s+.*)?$"),

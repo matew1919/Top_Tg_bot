@@ -111,6 +111,43 @@
         }
       ],
       "compacted": false
+    },
+    {
+      "chat_id": 1863437123,
+      "mode": "general",
+      "messages": [
+        {
+          "role": "user",
+          "content": "привет",
+          "user_id": 1863437123,
+          "user_name": "Мистер Бомбастик"
+        },
+        {
+          "role": "assistant",
+          "content": "Здарова, че как?"
+        },
+        {
+          "role": "user",
+          "content": "ты кто",
+          "user_id": 1863437123,
+          "user_name": "Мистер Бомбастик"
+        },
+        {
+          "role": "assistant",
+          "content": "Питер. А ты типа память потерял или че?"
+        },
+        {
+          "role": "user",
+          "content": "ну че там",
+          "user_id": 1863437123,
+          "user_name": "Мистер Бомбастик"
+        },
+        {
+          "role": "assistant",
+          "content": "Да че, сижу, в потолок плюю. У тебя че нового?"
+        }
+      ],
+      "compacted": false
     }
   ]
 }
