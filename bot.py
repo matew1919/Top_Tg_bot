@@ -24,11 +24,12 @@ import json
 import socket
 import tempfile
 import threading
+from collections import defaultdict, deque
 from base64 import b64encode
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, TypeVar
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -37,6 +38,7 @@ from gigachat import GigaChat
 from openai import OpenAI
 from telegram import Message, Update
 from telegram.constants import ChatAction
+from telegram.error import BadRequest, NetworkError, RetryAfter
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
@@ -58,18 +60,29 @@ from media_processing import (
     normalize_image,
     probe_media_duration,
 )
+from runtime_storage import atomic_write_text, load_json_object, migrate_legacy_runtime_files
+from vacancy_monitor import VacancyMonitor, load_vacancy_monitor_settings
+from vacancy_parser import format_vacancy
 
 
 LOGGER = logging.getLogger(__name__)
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 MAX_TOOL_ROUNDS = 6
 BOT_INSTANCE_LOCK_PORT = 47653
+VACANCY_INSTANCE_LOCK_PORT = 47654
 SAME_USER_CONTEXT_STREAK = 3
 REMINDER_MAX_DELIVERY_ATTEMPTS = 5
 REMINDER_RETRY_BASE_SECONDS = 60
 REMINDER_RETRY_MAX_SECONDS = 3600
 TELEGRAM_CLOUD_MAX_DOWNLOAD_BYTES = 20_000_000
 MEDIA_GROUP_SETTLE_SECONDS = 0.8
+TELEGRAM_REQUEST_POOL_SIZE = 16
+TELEGRAM_UPDATES_POOL_SIZE = 2
+TELEGRAM_SEND_ATTEMPTS = 3
+TELEGRAM_TYPING_DELAY_SECONDS = 0.75
+TELEGRAM_TYPING_INTERVAL_SECONDS = 4.0
+TELEGRAM_TYPING_REQUEST_TIMEOUT_SECONDS = 3.0
+TelegramResult = TypeVar("TelegramResult")
 DIALOGUE_SYSTEM_PROMPT = """Дополнительные правила естественного диалога:
 - Последнее сообщение пользователя — текущая задача. История и память ниже являются только фоном, а не поводом менять тему ответа.
 - Не упоминай факты из памяти, имя пользователя, учёбу, цели, интересы или старые темы, если они не помогают прямо ответить на последнее сообщение.
@@ -129,6 +142,8 @@ class Settings:
     soft_context_limit: int
     hard_context_limit: int
     keep_last_messages: int
+    group_context_limit: int
+    group_context_idle_seconds: int
     context_history_file: str
     memory_file: str
     memory_max_tokens: int
@@ -143,6 +158,14 @@ class Settings:
     api_journal_file: str
     api_journal_max_entries: int
     api_journal_enabled: bool
+    api_journal_include_content: bool
+    bot_owner_ids: frozenset[int]
+    request_rate_limit_count: int
+    request_rate_limit_window_seconds: int
+    max_concurrent_requests: int
+    search_proxy_url: str | None
+    vacancy_autostart: bool
+    vacancy_config_file: str
     media_max_bytes: int
     media_max_duration_seconds: int
     media_max_frames: int
@@ -151,6 +174,7 @@ class Settings:
     media_max_files_per_turn: int
     media_max_turn_bytes: int
     media_max_image_payload_bytes: int
+    media_max_concurrent_jobs: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -174,6 +198,16 @@ class Settings:
                 return raw
             return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
+        def integer_set(name: str) -> frozenset[int]:
+            raw = value(name, [])
+            values = raw if isinstance(raw, list) else str(raw).split(",")
+            result: set[int] = set()
+            for item in values:
+                clean = str(item).strip()
+                if clean:
+                    result.add(int(clean))
+            return frozenset(result)
+
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         if not token:
             raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
@@ -183,6 +217,11 @@ class Settings:
             raise RuntimeError("AI_PROVIDER must be either 'gigachat' or 'vsegpt'")
         vsegpt_api_key = os.getenv("VSEGPT_API_KEY", "").strip() or None
         telegram_proxy_url = text("telegram_proxy_url", "").strip() or None
+        soft_context_limit = max(2, integer("soft_context_limit", 8))
+        hard_context_limit = max(
+            soft_context_limit + 2,
+            integer("hard_context_limit", 20),
+        )
 
         return cls(
             telegram_token=token,
@@ -197,7 +236,7 @@ class Settings:
             gigachat_scope=text("gigachat_scope", "GIGACHAT_API_PERS"),
             gigachat_model=text("gigachat_model", "GigaChat-2-Pro"),
             gigachat_base_url=text("gigachat_base_url", "https://api.giga.chat/v1"),
-            gigachat_verify_ssl=bool(value("gigachat_verify_ssl", False)),
+            gigachat_verify_ssl=boolean("gigachat_verify_ssl", False),
             gigachat_timeout=number("gigachat_timeout", 60),
             gigachat_max_retries=max(0, integer("gigachat_max_retries", 3)),
             vsegpt_api_key=vsegpt_api_key,
@@ -230,12 +269,19 @@ class Settings:
                 "english_coach_prompt",
                 "Act as a strict but friendly English teacher. Be concise and use plain text.",
             ),
-            soft_context_limit=max(2, integer("soft_context_limit", 8)),
-            hard_context_limit=max(3, integer("hard_context_limit", 20)),
+            soft_context_limit=soft_context_limit,
+            hard_context_limit=hard_context_limit,
             keep_last_messages=max(1, integer("keep_last_messages", 2)),
-            context_history_file=text("context_history_file", "context_history.json")
-            or "context_history.json",
-            memory_file=text("memory_file", "memory.json") or "memory.json",
+            group_context_limit=max(2, integer("group_context_limit", 8)),
+            group_context_idle_seconds=max(
+                60, integer("group_context_idle_seconds", 3600)
+            ),
+            context_history_file=text(
+                "context_history_file", "runtime/context_history.json"
+            )
+            or "runtime/context_history.json",
+            memory_file=text("memory_file", "runtime/memory.json")
+            or "runtime/memory.json",
             memory_max_tokens=max(64, integer("memory_max_tokens", 150)),
             memory_prompt=text(
                 "memory_prompt",
@@ -247,7 +293,8 @@ class Settings:
                 "USER_FACT: user_id|name|факт. Если фактов нет, верни EMPTY.",
             ),
             max_english_history_messages=max(1, integer("max_english_history_messages", 1)),
-            reminders_file=text("reminders_file", "reminders.json") or "reminders.json",
+            reminders_file=text("reminders_file", "runtime/reminders.json")
+            or "runtime/reminders.json",
             reminder_schedule_prompt=text(
                 "reminder_schedule_prompt",
                 "Определи время напоминания и верни TIME и TEXT отдельными строками.",
@@ -259,10 +306,27 @@ class Settings:
             timezone=text("timezone", "Europe/Moscow") or "Europe/Moscow",
             reminder_poll_seconds=max(5, integer("reminder_poll_seconds", 15)),
             log_level=text("log_level", "INFO").upper(),
-            api_journal_file=text("api_journal_file", "api_journal.jsonl")
-            or "api_journal.jsonl",
+            api_journal_file=text("api_journal_file", "runtime/api_journal.jsonl")
+            or "runtime/api_journal.jsonl",
             api_journal_max_entries=max(1, integer("api_journal_max_entries", 200)),
-            api_journal_enabled=boolean("api_journal_enabled", True),
+            api_journal_enabled=boolean("api_journal_enabled", False),
+            api_journal_include_content=boolean(
+                "api_journal_include_content", False
+            ),
+            bot_owner_ids=integer_set("bot_owner_ids"),
+            request_rate_limit_count=max(
+                1, integer("request_rate_limit_count", 10)
+            ),
+            request_rate_limit_window_seconds=max(
+                1, integer("request_rate_limit_window_seconds", 60)
+            ),
+            max_concurrent_requests=max(
+                1, integer("max_concurrent_requests", 4)
+            ),
+            search_proxy_url=text("search_proxy_url", "").strip() or None,
+            vacancy_autostart=boolean("vacancy_autostart", True),
+            vacancy_config_file=text("vacancy_config_file", "vacancy_config.json")
+            or "vacancy_config.json",
             media_max_bytes=min(
                 TELEGRAM_CLOUD_MAX_DOWNLOAD_BYTES,
                 max(1_000_000, integer("media_max_bytes", 19_000_000)),
@@ -291,6 +355,10 @@ class Settings:
             media_max_image_payload_bytes=max(
                 500_000,
                 integer("media_max_image_payload_bytes", 6_000_000),
+            ),
+            media_max_concurrent_jobs=max(
+                1,
+                min(8, integer("media_max_concurrent_jobs", 2)),
             ),
         )
 
@@ -423,23 +491,35 @@ def project_path(filename: str) -> Path:
     )
 
 
-def atomic_write_text(path: Path, text: str) -> None:
-    """Durably replace a text file without exposing a partially written JSON file."""
+class RequestRateLimiter:
+    """Small in-memory sliding-window limiter keyed by chat and user."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
-    try:
-        with temporary_path.open("w", encoding="utf-8", newline="") as temporary_file:
-            temporary_file.write(text)
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
-        temporary_path.replace(path)
-    except Exception:
-        try:
-            temporary_path.unlink(missing_ok=True)
-        except OSError:
-            LOGGER.debug("Could not remove temporary file %s", temporary_path, exc_info=True)
-        raise
+    def __init__(self, request_count: int, window_seconds: int) -> None:
+        self.request_count = max(1, request_count)
+        self.window_seconds = max(1, window_seconds)
+        self._events: defaultdict[tuple[int, int], deque[float]] = defaultdict(deque)
+
+    def allow(self, key: tuple[int, int], now: float) -> tuple[bool, int]:
+        events = self._events[key]
+        cutoff = now - self.window_seconds
+        while events and events[0] <= cutoff:
+            events.popleft()
+        if len(events) >= self.request_count:
+            retry_after = max(1, int(events[0] + self.window_seconds - now) + 1)
+            return False, retry_after
+        events.append(now)
+        return True, 0
+
+
+def is_bot_owner(settings: Settings, user_id: int | None) -> bool:
+    return user_id is not None and user_id in settings.bot_owner_ids
+
+
+async def run_limited(semaphore: object, operation):
+    if isinstance(semaphore, asyncio.Semaphore):
+        async with semaphore:
+            return await operation
+    return await operation
 
 
 def timezone_now(timezone_name: str) -> datetime:
@@ -452,15 +532,19 @@ def timezone_now(timezone_name: str) -> datetime:
 
 
 async def _typing_loop(bot: object, chat_id: int) -> None:
-    """Keep Telegram's typing indicator visible during a slow API request."""
+    """Keep typing visible without monopolizing an outbound connection."""
 
     try:
+        await asyncio.sleep(TELEGRAM_TYPING_DELAY_SECONDS)
         while True:
             try:
-                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                await asyncio.wait_for(
+                    bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING),
+                    timeout=TELEGRAM_TYPING_REQUEST_TIMEOUT_SECONDS,
+                )
             except Exception:
                 LOGGER.debug("Could not send typing status", exc_info=True)
-            await asyncio.sleep(4)
+            await asyncio.sleep(TELEGRAM_TYPING_INTERVAL_SECONDS)
     except asyncio.CancelledError:
         raise
 
@@ -477,15 +561,80 @@ async def run_with_typing(bot: object, chat_id: int, operation):
             pass
 
 
-class ApiJournal:
-    """Store the exact model messages and generated text without API secrets."""
+def _retry_after_seconds(error: RetryAfter) -> float:
+    value = error.retry_after
+    if isinstance(value, timedelta):
+        return max(0.0, value.total_seconds())
+    return max(0.0, float(value))
 
-    def __init__(self, filename: str, max_entries: int, enabled: bool) -> None:
+
+async def telegram_request_with_retry(
+    request_factory: Callable[[], Awaitable[TelegramResult]],
+    operation_name: str,
+) -> TelegramResult:
+    """Retry outbound Telegram calls that fail from network or pool pressure."""
+
+    for attempt in range(1, TELEGRAM_SEND_ATTEMPTS + 1):
+        last_error: Exception | None = None
+        try:
+            return await request_factory()
+        except RetryAfter as error:
+            if attempt >= TELEGRAM_SEND_ATTEMPTS:
+                raise
+            last_error = error
+            delay = _retry_after_seconds(error) + 0.1
+        except NetworkError as error:
+            if isinstance(error, BadRequest) or attempt >= TELEGRAM_SEND_ATTEMPTS:
+                raise
+            last_error = error
+            delay = min(4.0, 0.5 * (2 ** (attempt - 1)))
+        LOGGER.warning(
+            "Telegram %s failed (%s/%s): %s; retrying in %.2fs",
+            operation_name,
+            attempt,
+            TELEGRAM_SEND_ATTEMPTS,
+            last_error,
+            delay,
+        )
+        await asyncio.sleep(delay)
+
+    raise RuntimeError("Telegram retry loop ended unexpectedly")
+
+
+async def reply_text_with_retry(message: Message, text: str) -> Message:
+    return await telegram_request_with_retry(
+        lambda: message.reply_text(text),
+        "reply",
+    )
+
+
+class ApiJournal:
+    """Store bounded diagnostics, excluding conversation content by default."""
+
+    def __init__(
+        self,
+        filename: str,
+        max_entries: int,
+        enabled: bool,
+        include_content: bool = False,
+    ) -> None:
         self.path = project_path(filename)
         self.max_entries = max(1, max_entries)
         self.enabled = enabled
+        self.include_content = include_content
         self._lock = threading.Lock()
-        LOGGER.info("API journal: %s%s", self.path, " (enabled)" if enabled else " (disabled)")
+        self._entry_count = 0
+        if self.path.exists():
+            try:
+                self._entry_count = len(self.path.read_text(encoding="utf-8").splitlines())
+            except OSError:
+                LOGGER.warning("Could not inspect API journal %s", self.path)
+        detail = "full content" if include_content else "metadata only"
+        LOGGER.info(
+            "API journal: %s%s",
+            self.path,
+            f" (enabled, {detail})" if enabled else " (disabled)",
+        )
 
     @staticmethod
     def _safe(value: object) -> object:
@@ -507,6 +656,21 @@ class ApiJournal:
             return value
         return str(value)
 
+    @staticmethod
+    def _metadata(value: object) -> object:
+        if isinstance(value, list):
+            roles = [
+                str(item.get("role") or "")
+                for item in value
+                if isinstance(item, dict)
+            ]
+            return {"item_count": len(value), "roles": roles}
+        if isinstance(value, dict):
+            return {"keys": sorted(str(key) for key in value)}
+        if isinstance(value, str):
+            return {"character_count": len(value)}
+        return {"type": type(value).__name__}
+
     def record(
         self,
         *,
@@ -525,22 +689,33 @@ class ApiJournal:
             "model": model,
             "kind": kind,
             "chat_id": chat_id,
-            "messages": self._safe(messages),
-            "response": self._safe(response),
+            "messages": (
+                self._safe(messages)
+                if self.include_content
+                else self._metadata(messages)
+            ),
+            "response": (
+                self._safe(response)
+                if self.include_content
+                else self._metadata(response)
+            ),
         }
         serialized = json.dumps(entry, ensure_ascii=False)
         with self._lock:
             try:
-                existing = (
-                    self.path.read_text(encoding="utf-8").splitlines()
-                    if self.path.exists()
-                    else []
-                )
-                existing.append(serialized)
-                atomic_write_text(
-                    self.path,
-                    "\n".join(existing[-self.max_entries :]) + "\n",
-                )
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a", encoding="utf-8") as journal_file:
+                    journal_file.write(serialized + "\n")
+                self._entry_count += 1
+                rotation_slack = max(10, self.max_entries // 10)
+                if self._entry_count > self.max_entries + rotation_slack:
+                    existing = self.path.read_text(encoding="utf-8").splitlines()
+                    atomic_write_text(
+                        self.path,
+                        "\n".join(existing[-self.max_entries :]) + "\n",
+                        keep_backup=False,
+                    )
+                    self._entry_count = min(len(existing), self.max_entries)
             except OSError:
                 LOGGER.exception("Could not write API journal %s", self.path)
 
@@ -567,6 +742,35 @@ class ApiJournal:
                 break
         return entries
 
+    def purge_chat(self, chat_id: int) -> int:
+        if not self.path.exists():
+            return 0
+        with self._lock:
+            try:
+                lines = self.path.read_text(encoding="utf-8").splitlines()
+                kept: list[str] = []
+                removed = 0
+                for line in lines:
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        kept.append(line)
+                        continue
+                    if isinstance(item, dict) and item.get("chat_id") == chat_id:
+                        removed += 1
+                    else:
+                        kept.append(line)
+                atomic_write_text(
+                    self.path,
+                    ("\n".join(kept) + "\n") if kept else "",
+                    keep_backup=False,
+                )
+                self._entry_count = len(kept)
+                return removed
+            except OSError:
+                LOGGER.exception("Could not purge API journal for chat %s", chat_id)
+                return 0
+
 
 class ContextHistoryStore:
     """Persist the active per-chat conversation context across restarts."""
@@ -578,10 +782,10 @@ class ContextHistoryStore:
 
     def load(self) -> tuple[dict[tuple[int, str], list[dict[str, object]]], set[tuple[int, str]]]:
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = load_json_object(self.path)
         except FileNotFoundError:
             return {}, set()
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, ValueError):
             LOGGER.warning("Could not load context history %s; starting empty", self.path)
             return {}, set()
 
@@ -605,6 +809,8 @@ class ContextHistoryStore:
                 if role not in {"user", "assistant"} or not isinstance(content, str):
                     continue
                 restored: dict[str, object] = {"role": role, "content": content}
+                if isinstance(message.get("created_at"), str):
+                    restored["created_at"] = message["created_at"]
                 if role == "user":
                     if isinstance(message.get("user_id"), int):
                         restored["user_id"] = message["user_id"]
@@ -653,6 +859,7 @@ class MemoryStore:
             "chats": {},
             "users": {},
             "chat_types": {},
+            "preferences": {},
         }
         self._lock = threading.Lock()
         LOGGER.info("Memory file: %s", self.path)
@@ -662,13 +869,13 @@ class MemoryStore:
 
     def _load(self) -> None:
         try:
-            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            loaded = load_json_object(self.path)
             if isinstance(loaded, dict):
                 self.data.update(loaded)
                 self._normalize()
         except FileNotFoundError:
             return
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, ValueError):
             LOGGER.warning("Could not load memory file %s; starting empty", self.path)
 
     @classmethod
@@ -697,6 +904,7 @@ class MemoryStore:
         chats = self.data.setdefault("chats", {})
         users = self.data.setdefault("users", {})
         chat_types = self.data.setdefault("chat_types", {})
+        preferences = self.data.setdefault("preferences", {})
         # Older branch versions created a merged global profile index. It is
         # intentionally discarded: shared-chat memories must stay separate.
         self.data.pop("profiles", None)
@@ -706,6 +914,8 @@ class MemoryStore:
             self.data["users"] = users = {}
         if not isinstance(chat_types, dict):
             self.data["chat_types"] = chat_types = {}
+        if not isinstance(preferences, dict):
+            self.data["preferences"] = {}
         for chat in chats.values():
             if isinstance(chat, dict):
                 self._normalize_scope(chat)
@@ -1059,6 +1269,43 @@ class MemoryStore:
 
         self._save()
 
+    def forget_user(self, user_id: int, private_chat_id: int) -> None:
+        """Remove one user's stored facts from every chat and their private scope."""
+
+        users = self.data.get("users", {})
+        if isinstance(users, dict):
+            for chat_users in users.values():
+                if isinstance(chat_users, dict):
+                    chat_users.pop(str(user_id), None)
+            users.pop(str(private_chat_id), None)
+        chats = self.data.get("chats", {})
+        if isinstance(chats, dict):
+            chats.pop(str(private_chat_id), None)
+        preferences = self.data.get("preferences", {})
+        if isinstance(preferences, dict):
+            preferences.pop(str(user_id), None)
+        self._save()
+
+    def user_timezone(self, user_id: int, default: str) -> str:
+        preferences = self.data.get("preferences", {})
+        preference = (
+            preferences.get(str(user_id), {}) if isinstance(preferences, dict) else {}
+        )
+        timezone_name = preference.get("timezone") if isinstance(preference, dict) else None
+        if isinstance(timezone_name, str) and timezone_name.strip():
+            return timezone_name.strip()
+        return default
+
+    def set_user_timezone(self, user_id: int, timezone_name: str) -> None:
+        preferences = self.data.setdefault("preferences", {})
+        if not isinstance(preferences, dict):
+            self.data["preferences"] = preferences = {}
+        preference = preferences.setdefault(str(user_id), {})
+        if not isinstance(preference, dict):
+            preferences[str(user_id)] = preference = {}
+        preference["timezone"] = timezone_name
+        self._save()
+
 
 class ReminderStore:
     """Persistent one-shot reminder tasks."""
@@ -1074,7 +1321,7 @@ class ReminderStore:
 
     def _load(self) -> None:
         try:
-            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            loaded = load_json_object(self.path)
             if isinstance(loaded, dict):
                 self.data.update(loaded)
             reminders = self.data.get("reminders")
@@ -1097,7 +1344,7 @@ class ReminderStore:
                     self._save()
         except FileNotFoundError:
             return
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, ValueError):
             LOGGER.warning("Could not load reminders file %s; starting empty", self.path)
 
     def _save(self) -> None:
@@ -1185,6 +1432,61 @@ class ReminderStore:
             if not isinstance(reminder, dict) or reminder.get("id") != reminder_id
         ]
         self._save()
+
+    def list_owned(self, chat_id: int, user_id: int) -> list[dict[str, object]]:
+        reminders = self.data.get("reminders", [])
+        if not isinstance(reminders, list):
+            return []
+        result = [
+            reminder.copy()
+            for reminder in reminders
+            if isinstance(reminder, dict)
+            and reminder.get("chat_id") == chat_id
+            and reminder.get("user_id") == user_id
+        ]
+        return sorted(result, key=lambda item: str(item.get("due_at") or ""))
+
+    def _find_owned(
+        self, chat_id: int, user_id: int, identifier: str
+    ) -> dict[str, object] | None:
+        clean = identifier.strip().lower()
+        if len(clean) < 4:
+            return None
+        matches = [
+            reminder
+            for reminder in self.data.get("reminders", [])
+            if isinstance(reminder, dict)
+            and reminder.get("chat_id") == chat_id
+            and reminder.get("user_id") == user_id
+            and str(reminder.get("id") or "").lower().startswith(clean)
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def cancel_owned(self, chat_id: int, user_id: int, identifier: str) -> bool:
+        reminder = self._find_owned(chat_id, user_id, identifier)
+        if reminder is None:
+            return False
+        self.remove(str(reminder.get("id") or ""))
+        return True
+
+    def snooze_owned(
+        self,
+        chat_id: int,
+        user_id: int,
+        identifier: str,
+        due_at: datetime,
+    ) -> dict[str, object] | None:
+        reminder = self._find_owned(chat_id, user_id, identifier)
+        if reminder is None:
+            return None
+        reminder["due_at"] = due_at.isoformat()
+        reminder["status"] = "active"
+        reminder["delivery_attempts"] = 0
+        reminder.pop("delivery_text", None)
+        reminder.pop("last_error", None)
+        reminder.pop("next_attempt_at", None)
+        self._save()
+        return reminder.copy()
 
     def set_delivery_text(self, reminder_id: str, text: str) -> None:
         reminders = self.data.get("reminders", [])
@@ -1352,18 +1654,46 @@ class ReplyService:
             settings.api_journal_file,
             settings.api_journal_max_entries,
             settings.api_journal_enabled,
+            settings.api_journal_include_content,
         )
         self.tools = ToolRegistry()
         self._vsegpt_request_lock = asyncio.Lock()
         self._vsegpt_last_request_at = 0.0
+        self.last_successful_api_at: datetime | None = None
+        self.last_api_error: str | None = None
         register_builtin_tools(
             self.tools,
             self._create_reminder_tool,
-            search_proxy=settings.telegram_proxy_url,
+            search_proxy=settings.search_proxy_url,
         )
 
     def _save_history(self) -> None:
         self.history_store.save(self.history, self.compacted_history)
+
+    def forget_user_data(self, user_id: int, private_chat_id: int) -> None:
+        self.memory.forget_user(user_id, private_chat_id)
+        for key, messages in list(self.history.items()):
+            if key[0] == private_chat_id:
+                self.history.pop(key, None)
+                self.compacted_history.discard(key)
+                continue
+            cleaned: list[dict[str, object]] = []
+            skip_following_assistant = False
+            for item in messages:
+                if item.get("role") == "user":
+                    if item.get("user_id") == user_id:
+                        skip_following_assistant = True
+                        continue
+                    # An answer after another participant's message belongs to
+                    # that participant, not to the deleted user's earlier turn.
+                    skip_following_assistant = False
+                if skip_following_assistant and item.get("role") == "assistant":
+                    skip_following_assistant = False
+                    continue
+                cleaned.append(item)
+            self.history[key] = cleaned
+        self._save_history()
+        self.journal.purge_chat(private_chat_id)
 
     @staticmethod
     def _is_retryable_api_error(error: Exception) -> bool:
@@ -1422,11 +1752,16 @@ class ReplyService:
         kind: str,
         chat_id: int | None,
     ):
-        response = await asyncio.to_thread(
-            self.gigachat_client.chat.create,
-            {"model": self.settings.gigachat_model, "messages": request},
-        )
-        self.journal.record(
+        try:
+            response = await asyncio.to_thread(
+                self.gigachat_client.chat.create,
+                {"model": self.settings.gigachat_model, "messages": request},
+            )
+        except Exception as error:
+            self.last_api_error = (str(error) or type(error).__name__)[:300]
+            raise
+        await asyncio.to_thread(
+            self.journal.record,
             provider="gigachat",
             model=self.settings.gigachat_model,
             kind=kind,
@@ -1434,6 +1769,8 @@ class ReplyService:
             messages=request,
             response=self._gigachat_response_text(response),
         )
+        self.last_successful_api_at = datetime.now(dt_timezone.utc)
+        self.last_api_error = None
         return response
 
     async def _vsegpt_chat(
@@ -1452,7 +1789,8 @@ class ReplyService:
                     self.vsegpt_client.chat.completions.create,
                     **kwargs,
                 )
-                self.journal.record(
+                await asyncio.to_thread(
+                    self.journal.record,
                     provider="vsegpt",
                     model=str(kwargs.get("model", "")),
                     kind=kind,
@@ -1460,8 +1798,11 @@ class ReplyService:
                     messages=kwargs.get("messages", []),
                     response=self._vsegpt_response_text(response),
                 )
+                self.last_successful_api_at = datetime.now(dt_timezone.utc)
+                self.last_api_error = None
                 return response
             except Exception as error:
+                self.last_api_error = (str(error) or type(error).__name__)[:300]
                 if attempt + 1 >= attempts or not self._is_retryable_api_error(error):
                     raise
                 delay = min(8.0, 0.75 * (2**attempt))
@@ -1483,10 +1824,12 @@ class ReplyService:
     ) -> dict[str, object] | None:
         """Create a reminder through the existing parser and JSON store."""
 
+        timezone_name = self.memory.user_timezone(user_id, self.settings.timezone)
         parsed = await self.resolve_reminder(
             request,
-            timezone_now(self.settings.timezone),
+            timezone_now(timezone_name),
             chat_id,
+            timezone_name,
         )
         if parsed is None:
             return None
@@ -1679,6 +2022,7 @@ class ReplyService:
         messages: list[dict[str, object]],
         current_user_id: int,
         mode: str,
+        is_private_chat: bool,
     ) -> list[dict[str, str]]:
         def format_message(message: dict[str, object]) -> str:
             content = str(message["content"])
@@ -1712,7 +2056,11 @@ class ReplyService:
         history_limit = (
             self.settings.max_english_history_messages
             if mode == "english_coach"
-            else self.settings.soft_context_limit
+            else (
+                self.settings.soft_context_limit
+                if is_private_chat
+                else self.settings.group_context_limit
+            )
         )
         latest_user_text = str(user_messages[-1].get("content") or "") if user_messages else ""
         if mode == "general" and self._is_lightweight_message(latest_user_text):
@@ -1728,6 +2076,85 @@ class ReplyService:
             {"role": str(message["role"]), "content": format_message(message)}
             for message in selected
         ]
+
+    @staticmethod
+    def _history_now() -> datetime:
+        return datetime.now(dt_timezone.utc)
+
+    @staticmethod
+    def _parse_history_time(value: object) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt_timezone.utc)
+        return parsed.astimezone(dt_timezone.utc)
+
+    @staticmethod
+    def _last_complete_exchange(
+        messages: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        assistant_index = next(
+            (
+                index
+                for index in range(len(messages) - 1, -1, -1)
+                if messages[index].get("role") == "assistant"
+            ),
+            None,
+        )
+        if assistant_index is None:
+            return []
+        user_index = next(
+            (
+                index
+                for index in range(assistant_index - 1, -1, -1)
+                if messages[index].get("role") == "user"
+            ),
+            None,
+        )
+        if user_index is None:
+            return []
+        return [messages[user_index], messages[assistant_index]]
+
+    @staticmethod
+    def _trim_coherent_history(
+        messages: list[dict[str, object]], limit: int
+    ) -> None:
+        messages[:] = messages[-max(1, limit) :]
+        while messages and messages[0].get("role") == "assistant":
+            messages.pop(0)
+
+    def _reset_idle_group_history(
+        self,
+        messages: list[dict[str, object]],
+        now: datetime,
+    ) -> None:
+        last_assistant = next(
+            (
+                item
+                for item in reversed(messages)
+                if item.get("role") == "assistant"
+            ),
+            None,
+        )
+        if last_assistant is None:
+            return
+        last_reply_at = self._parse_history_time(last_assistant.get("created_at"))
+        idle_seconds = (
+            float("inf")
+            if last_reply_at is None
+            else max(0.0, (now - last_reply_at).total_seconds())
+        )
+        if idle_seconds <= self.settings.group_context_idle_seconds:
+            return
+        messages[:] = self._last_complete_exchange(messages)
+        LOGGER.info(
+            "Group context reduced to the last exchange after %.0f idle seconds",
+            idle_seconds,
+        )
 
     @staticmethod
     def _is_lightweight_message(text: str) -> bool:
@@ -1767,7 +2194,9 @@ class ReplyService:
             )
         sections.append(
             "Текущее локальное время: "
-            + timezone_now(self.settings.timezone).strftime("%Y-%m-%d %H:%M (%Z)")
+            + timezone_now(
+                self.memory.user_timezone(user_id, self.settings.timezone)
+            ).strftime("%Y-%m-%d %H:%M (%Z)")
         )
         return "\n\n".join(sections)
 
@@ -1886,19 +2315,38 @@ class ReplyService:
         user_name: str,
         text: str,
         mode: str,
+        is_private_chat: bool,
     ) -> list[dict[str, object]]:
         messages = self.history.setdefault((chat_id, mode), [])
-        history_limit = (
-            self.settings.max_english_history_messages
-            if mode == "english_coach"
-            else self.settings.soft_context_limit
-        )
+        now = self._history_now()
+        timestamp = now.isoformat(timespec="seconds")
+        if not is_private_chat:
+            self._reset_idle_group_history(messages, now)
         messages.append(
-            {"role": "user", "content": text, "user_id": user_id, "user_name": user_name}
+            {
+                "role": "user",
+                "content": text,
+                "user_id": user_id,
+                "user_name": user_name,
+                "created_at": timestamp,
+            }
         )
+        if not is_private_chat:
+            history_limit = (
+                self.settings.max_english_history_messages
+                if mode == "english_coach"
+                else self.settings.group_context_limit
+            )
+            self._trim_coherent_history(messages, history_limit)
+            self.compacted_history.discard((chat_id, mode))
+            self._save_history()
+            return messages
+
         self._save_history()
         if mode == "english_coach":
-            messages[:] = messages[-history_limit:]
+            self._trim_coherent_history(
+                messages, self.settings.max_english_history_messages
+            )
             self._save_history()
             return messages
 
@@ -1930,6 +2378,15 @@ class ReplyService:
                     "Hard context compaction skipped for chat %s because memory extraction failed",
                     chat_id,
                 )
+                if len(messages) > self.settings.hard_context_limit * 2:
+                    self._trim_coherent_history(
+                        messages,
+                        self.settings.hard_context_limit,
+                    )
+                    LOGGER.error(
+                        "History for chat %s was locally bounded after repeated compaction failures",
+                        chat_id,
+                    )
 
         assistant_messages = [item for item in messages if item.get("role") == "assistant"]
         key = (chat_id, mode)
@@ -1994,7 +2451,8 @@ class ReplyService:
                     if isinstance(response, str)
                     else str(getattr(response, "text", "") or "")
                 ).strip()
-                self.journal.record(
+                await asyncio.to_thread(
+                    self.journal.record,
                     provider="vsegpt",
                     model=self.settings.vsegpt_transcription_model,
                     kind="transcription",
@@ -2051,7 +2509,15 @@ class ReplyService:
         self.memory.remember_user(chat_id, user_id, user_name, chat_type)
         configured_name = self.memory.user_name(chat_id, user_id)
         speaker_name = configured_name or str(user_id)
-        messages = await self._prepare_history(chat_id, user_id, speaker_name, text, mode)
+        is_private_chat = chat_type == "private" or self.memory.is_private_chat(chat_id)
+        messages = await self._prepare_history(
+            chat_id,
+            user_id,
+            speaker_name,
+            text,
+            mode,
+            is_private_chat,
+        )
 
         try:
             system_message = (
@@ -2061,7 +2527,7 @@ class ReplyService:
             )
             request_messages = [
                 {"role": "system", "content": system_message},
-                *self._api_messages(messages, user_id, mode),
+                *self._api_messages(messages, user_id, mode, is_private_chat),
             ]
             request_messages = self._attach_images_to_latest_user_message(
                 request_messages,
@@ -2076,8 +2542,7 @@ class ReplyService:
                 )
                 if not response.messages:
                     raise RuntimeError("GigaChat returned an empty response")
-                parts = response.messages[0].content or []
-                answer = "".join(part.text or "" for part in parts).strip()
+                answer = self._gigachat_response_text(response).strip()
             else:
                 if mode == "general" and allow_tools and not images:
                     answer = await self._vsegpt_reply_with_tools(
@@ -2086,7 +2551,9 @@ class ReplyService:
                             chat_id=chat_id,
                             user_id=user_id,
                             user_name=speaker_name,
-                            timezone=self.settings.timezone,
+                            timezone=self.memory.user_timezone(
+                                user_id, self.settings.timezone
+                            ),
                         ),
                         status_callback=tool_status_callback,
                     )
@@ -2107,14 +2574,35 @@ class ReplyService:
                     answer = (response.choices[0].message.content or "").strip()
         except Exception:
             LOGGER.exception("AI response failed")
-            answer = "Не смог обработать сообщение. Попробуйте ещё раз позже."
+            if messages and messages[-1].get("role") == "user":
+                messages.pop()
+                self._save_history()
+            return "Не смог обработать сообщение. Попробуйте ещё раз позже."
 
         if answer:
-            messages.append({"role": "assistant", "content": answer})
-            if mode == "english_coach":
-                messages[:] = messages[-self.settings.max_english_history_messages :]
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": answer,
+                    "created_at": self._history_now().isoformat(timespec="seconds"),
+                }
+            )
+            if not is_private_chat:
+                history_limit = (
+                    self.settings.max_english_history_messages
+                    if mode == "english_coach"
+                    else self.settings.group_context_limit
+                )
+                self._trim_coherent_history(messages, history_limit)
+            elif mode == "english_coach":
+                self._trim_coherent_history(
+                    messages, self.settings.max_english_history_messages
+                )
             self._save_history()
             return answer
+        if messages and messages[-1].get("role") == "user":
+            messages.pop()
+            self._save_history()
         return "Модель вернула пустой ответ. Попробуйте ещё раз."
 
     @staticmethod
@@ -2143,7 +2631,11 @@ class ReplyService:
         return (due_at, reminder_text or fallback_text) if reminder_text else None
 
     async def resolve_reminder(
-        self, command_text: str, now: datetime, chat_id: int | None = None
+        self,
+        command_text: str,
+        now: datetime,
+        chat_id: int | None = None,
+        timezone_name: str | None = None,
     ) -> tuple[datetime, str] | None:
         """Let the model understand natural time, with a local parser fallback."""
 
@@ -2159,7 +2651,7 @@ class ReplyService:
             + "\nCurrent local time: "
             + now.strftime("%Y-%m-%d %H:%M")
             + "\nTimezone: "
-            + self.settings.timezone
+            + (timezone_name or self.settings.timezone)
         )
         request = [
             {"role": "system", "content": schedule_prompt},
@@ -2378,7 +2870,9 @@ class MediaProcessor:
     def __init__(self, service: ReplyService) -> None:
         self.service = service
         self.settings = service.settings
-        self._semaphore = asyncio.Semaphore(2)
+        self._semaphore = asyncio.Semaphore(
+            getattr(self.settings, "media_max_concurrent_jobs", 2)
+        )
 
     @staticmethod
     def _trim(text: str, limit: int) -> str:
@@ -2723,9 +3217,12 @@ async def reminder_loop(application: Application) -> None:
                         )
                         generated = generated or f"Напоминание: {original_text}"
                         store.set_delivery_text(reminder_id, generated)
-                    await application.bot.send_message(
-                        chat_id=int(reminder["chat_id"]),
-                        text=generated,
+                    await telegram_request_with_retry(
+                        lambda: application.bot.send_message(
+                            chat_id=int(reminder["chat_id"]),
+                            text=generated,
+                        ),
+                        "reminder delivery",
                     )
                     store.remove(reminder_id)
                     LOGGER.info("Reminder delivered: %s", reminder_id)
@@ -2747,23 +3244,144 @@ async def reminder_loop(application: Application) -> None:
         raise
 
 
+async def send_vacancy_message(
+    application: Application,
+    chat_id: int,
+    text: str,
+) -> None:
+    await telegram_request_with_retry(
+        lambda: application.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            disable_web_page_preview=True,
+        ),
+        "vacancy notification",
+    )
+
+
+async def vacancy_loop(application: Application) -> None:
+    monitor: VacancyMonitor = application.bot_data["vacancy_monitor"]
+
+    async def sender(chat_id: int, text: str) -> None:
+        await send_vacancy_message(application, chat_id, text)
+
+    LOGGER.info("Vacancy scheduler started")
+    try:
+        await monitor.run(sender)
+    except asyncio.CancelledError:
+        LOGGER.info("Vacancy scheduler stopped")
+        raise
+
+
+async def vacancy_locking_loop(application: Application) -> None:
+    """Wait for an old standalone watcher to exit, then own monitoring."""
+
+    while True:
+        vacancy_lock = acquire_vacancy_instance_lock()
+        if vacancy_lock is None:
+            application.bot_data["vacancy_lock_conflict"] = True
+            LOGGER.warning(
+                "Vacancy monitor is waiting because another standalone or bot monitor is running"
+            )
+            await asyncio.sleep(60)
+            continue
+        application.bot_data["vacancy_lock_conflict"] = False
+        application.bot_data["vacancy_instance_lock"] = vacancy_lock
+        try:
+            LOGGER.info("Vacancy monitor acquired the instance lock")
+            await vacancy_loop(application)
+        finally:
+            vacancy_lock.close()
+            application.bot_data.pop("vacancy_instance_lock", None)
+
+
+def acquire_vacancy_instance_lock() -> socket.socket | None:
+    lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        lock.bind(("127.0.0.1", VACANCY_INSTANCE_LOCK_PORT))
+        lock.listen(1)
+    except OSError:
+        lock.close()
+        return None
+    return lock
+
+
+async def supervise_background_task(
+    application: Application,
+    name: str,
+    worker: Callable[[Application], Awaitable[None]],
+) -> None:
+    crashes = 0
+    while True:
+        try:
+            await worker(application)
+            raise RuntimeError(f"Background task {name} stopped unexpectedly")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            crashes += 1
+            LOGGER.exception("Background task %s crashed; restarting", name)
+            error_type = type(error).__name__
+            service: ReplyService = application.bot_data["reply_service"]
+            if crashes == 1 or crashes % 5 == 0:
+                for owner_id in service.settings.bot_owner_ids:
+                    try:
+                        await telegram_request_with_retry(
+                            lambda owner_id=owner_id: application.bot.send_message(
+                                chat_id=owner_id,
+                                text=(
+                                    f"Фоновая задача {name} упала и будет перезапущена. "
+                                    f"Ошибка: {error_type}."
+                                ),
+                            ),
+                            f"{name} crash notification",
+                        )
+                    except Exception:
+                        LOGGER.exception(
+                            "Could not notify owner %s about %s crash", owner_id, name
+                        )
+            await asyncio.sleep(min(300, 10 * crashes))
+
+
 async def start_background_tasks(application: Application) -> None:
-    application.bot_data["reminder_task"] = asyncio.create_task(reminder_loop(application))
+    application.bot_data["reminder_task"] = asyncio.create_task(
+        supervise_background_task(application, "reminder-loop", reminder_loop),
+        name="reminder-supervisor",
+    )
+    service: ReplyService = application.bot_data["reply_service"]
+    monitor: VacancyMonitor = application.bot_data["vacancy_monitor"]
+    if service.settings.vacancy_autostart and monitor.settings.enabled:
+        application.bot_data["vacancy_task"] = asyncio.create_task(
+            supervise_background_task(
+                application,
+                "vacancy-loop",
+                vacancy_locking_loop,
+            ),
+            name="vacancy-supervisor",
+        )
+        LOGGER.info("Vacancy monitor autostarted with Telegram bot")
+    else:
+        LOGGER.info("Vacancy monitor autostart is disabled")
 
 
 async def stop_background_tasks(application: Application) -> None:
-    task = application.bot_data.get("reminder_task")
-    if not isinstance(task, asyncio.Task):
-        return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    for task_name in ("reminder_task", "vacancy_task"):
+        task = application.bot_data.get(task_name)
+        if not isinstance(task, asyncio.Task):
+            continue
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    vacancy_lock = application.bot_data.get("vacancy_instance_lock")
+    if isinstance(vacancy_lock, socket.socket):
+        vacancy_lock.close()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
+    await reply_text_with_retry(
+        update.effective_message,
         "Привет! Упомяните меня через @, начните сообщение с ?? или отправьте "
         "сообщение на английском языке — и я отвечу. В личке фото, голосовые, аудио, "
         "видео и YouTube-ссылки можно присылать сразу; в группе добавьте ?? или @. "
@@ -2772,7 +3390,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
+    await reply_text_with_retry(
+        update.effective_message,
         "Возможности бота:\n"
         "@бот текст — обычный ответ в чате.\n"
         "?? текст — обычный режим без упоминания.\n"
@@ -2782,6 +3401,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Если упомянуть бота в ответе, он учтёт исходное сообщение и его медиа.\n"
         "/н свободное описание времени и задачи — напоминание. Например: "
         "/н напомни завтра вечером купить продукты.\n"
+        "/reminders, /cancel ID, /snooze ID минуты — управление напоминаниями.\n"
+        "/timezone Europe/Moscow — персональный часовой пояс.\n"
+        "/memory и /forget confirm — просмотр и удаление памяти.\n"
+        "/vacancies status|check|show|on|off — мониторинг вакансий (владелец).\n"
+        "/status — состояние бота и фоновых задач (только владелец).\n"
         "/start — краткое описание.\n"
         "/help — эта справка.\n\n"
         "/log [N] — последние запросы к API (только в личном чате).\n\n"
@@ -2799,17 +3423,176 @@ def _journal_value(value: object, limit: int = 1800) -> str:
     return text
 
 
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not chat:
+        return
+    if chat.type != "private":
+        await reply_text_with_retry(message, "Команда /status доступна только в личном чате.")
+        return
+
+    service: ReplyService = context.application.bot_data["reply_service"]
+    if not is_bot_owner(service.settings, user.id if user else None):
+        await reply_text_with_retry(message, "Команда доступна только владельцу бота.")
+        return
+
+    now = datetime.now(dt_timezone.utc)
+    started_at = context.application.bot_data.get("started_at")
+    uptime_seconds = (
+        max(0, int((now - started_at).total_seconds()))
+        if isinstance(started_at, datetime)
+        else 0
+    )
+    hours, remainder = divmod(uptime_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    reminder_store: ReminderStore = context.application.bot_data["reminder_store"]
+    reminders = reminder_store.data.get("reminders", [])
+    status_counts: defaultdict[str, int] = defaultdict(int)
+    if isinstance(reminders, list):
+        for reminder in reminders:
+            if isinstance(reminder, dict):
+                status_counts[str(reminder.get("status") or "unknown")] += 1
+    reminder_task = context.application.bot_data.get("reminder_task")
+    scheduler_state = (
+        "работает"
+        if isinstance(reminder_task, asyncio.Task) and not reminder_task.done()
+        else "остановлен"
+    )
+    last_api = (
+        service.last_successful_api_at.astimezone(ZoneInfo(service.settings.timezone)).strftime(
+            "%d.%m.%Y %H:%M:%S"
+        )
+        if service.last_successful_api_at
+        else "ещё не было"
+    )
+    failed_note = "есть последняя ошибка" if service.last_api_error else "ошибок нет"
+    vacancy_monitor: VacancyMonitor = context.application.bot_data["vacancy_monitor"]
+    vacancy_task = context.application.bot_data.get("vacancy_task")
+    if context.application.bot_data.get("vacancy_lock_conflict"):
+        vacancy_state = "работает отдельным процессом"
+    elif isinstance(vacancy_task, asyncio.Task) and not vacancy_task.done():
+        vacancy_state = "работает внутри бота"
+    else:
+        vacancy_state = "остановлен"
+    journal_state = (
+        "выключен"
+        if not service.journal.enabled
+        else (
+            "полное содержимое"
+            if service.journal.include_content
+            else "только метаданные"
+        )
+    )
+    await reply_text_with_retry(
+        message,
+        "Состояние бота:\n"
+        f"Время работы: {hours}ч {minutes}м {seconds}с\n"
+        f"AI: {service.settings.ai_provider}/{service.settings.vsegpt_model if service.settings.ai_provider == 'vsegpt' else service.settings.gigachat_model}\n"
+        f"Последний успешный AI-запрос: {last_api} ({failed_note})\n"
+        f"Планировщик напоминаний: {scheduler_state}\n"
+        f"Парсер вакансий: {vacancy_state}; последний результат {vacancy_monitor.last_total}/{vacancy_monitor.last_matches}/{vacancy_monitor.last_new}\n"
+        f"Напоминания: активных {status_counts['active']}, обрабатывается {status_counts['processing']}, ошибок {status_counts['failed']}\n"
+        f"API-журнал: {journal_state}\n"
+        f"Лимит: {service.settings.request_rate_limit_count} запросов за {service.settings.request_rate_limit_window_seconds} сек., одновременно {service.settings.max_concurrent_requests}",
+    )
+
+
+async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    sender = update.effective_user
+    if not message or not chat or not sender:
+        return
+    if chat.type != "private":
+        await reply_text_with_retry(message, "Команда /memory доступна только в личном чате.")
+        return
+    service: ReplyService = context.application.bot_data["reply_service"]
+    memory_text = service.memory.personal_context(chat.id, sender.id).strip()
+    if not memory_text:
+        await reply_text_with_retry(message, "Сохранённой памяти о тебе пока нет.")
+        return
+    await reply_text_with_retry(
+        message,
+        "Сохранённая память:\n" + _journal_value(memory_text, limit=3400),
+    )
+
+
+async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    sender = update.effective_user
+    if not message or not chat or not sender:
+        return
+    if chat.type != "private":
+        await reply_text_with_retry(message, "Команда /forget доступна только в личном чате.")
+        return
+    confirmation = context.args[0].lower() if context.args else ""
+    if confirmation != "confirm":
+        await reply_text_with_retry(
+            message,
+            "Команда удалит твою память и рабочий контекст во всех чатах. Для подтверждения: /forget confirm",
+        )
+        return
+    service: ReplyService = context.application.bot_data["reply_service"]
+    service.forget_user_data(sender.id, chat.id)
+    await reply_text_with_retry(message, "Память и рабочий контекст о тебе удалены.")
+
+
+async def timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    sender = update.effective_user
+    if not message or not sender:
+        return
+    service: ReplyService = context.application.bot_data["reply_service"]
+    current = service.memory.user_timezone(sender.id, service.settings.timezone)
+    if not context.args:
+        await reply_text_with_retry(
+            message,
+            f"Текущий часовой пояс: {current}. Изменение: /timezone Europe/Moscow",
+        )
+        return
+    aliases = {
+        "москва": "Europe/Moscow",
+        "moscow": "Europe/Moscow",
+        "екатеринбург": "Asia/Yekaterinburg",
+        "новосибирск": "Asia/Novosibirsk",
+        "владивосток": "Asia/Vladivostok",
+    }
+    requested = " ".join(context.args).strip()
+    timezone_name = aliases.get(requested.lower(), requested)
+    try:
+        ZoneInfo(timezone_name)
+    except Exception:
+        await reply_text_with_retry(
+            message,
+            "Неизвестный часовой пояс. Используй формат Europe/Moscow или Asia/Yekaterinburg.",
+        )
+        return
+    service.memory.set_user_timezone(sender.id, timezone_name)
+    local_time = timezone_now(timezone_name).strftime("%d.%m.%Y %H:%M")
+    await reply_text_with_retry(
+        message,
+        f"Часовой пояс установлен: {timezone_name}. Сейчас {local_time}.",
+    )
+
+
 async def api_log_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     chat = update.effective_chat
     if not message or not chat:
         return
     if chat.type != "private":
-        await message.reply_text("Команда /log доступна только в личном чате.")
+        await reply_text_with_retry(message, "Команда /log доступна только в личном чате.")
         return
     service: ReplyService = context.application.bot_data["reply_service"]
+    sender = message.from_user
+    if not is_bot_owner(service.settings, sender.id if sender else None):
+        await reply_text_with_retry(message, "Команда доступна только владельцу бота.")
+        return
     if not service.journal.enabled:
-        await message.reply_text("Журнал API отключён в config.json.")
+        await reply_text_with_retry(message, "Журнал API отключён в config.json.")
         return
     try:
         limit = max(1, min(10, int(context.args[0]))) if context.args else 5
@@ -2817,7 +3600,9 @@ async def api_log_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         limit = 5
     entries = service.journal.recent(chat.id, limit)
     if not entries:
-        await message.reply_text("В журнале этого чата пока нет запросов к модели.")
+        await reply_text_with_retry(
+            message, "В журнале этого чата пока нет запросов к модели."
+        )
         return
 
     chunks: list[str] = []
@@ -2833,7 +3618,7 @@ async def api_log_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     text = "\n\n====================\n\n".join(chunks)
     while text:
         part, text = text[:3800], text[3800:]
-        await message.reply_text(part)
+        await reply_text_with_retry(message, part)
 
 
 async def handle_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2866,15 +3651,187 @@ async def handle_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         ),
     )
     if reminder is None:
-        await message.reply_text(
+        await reply_text_with_retry(
+            message,
             "Не смог понять время. Напиши, например: /н напомни завтра вечером купить продукты"
         )
         return
     due_at = datetime.fromisoformat(str(reminder["due_at"]))
-    await message.reply_text(
+    await reply_text_with_retry(
+        message,
         "Напоминание поставлено на "
         + due_at.strftime("%d.%m.%Y %H:%M")
-        + "."
+        + f". ID: {str(reminder['id'])[:8]}"
+    )
+
+
+async def list_reminders_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    sender = update.effective_user
+    if not message or not chat or not sender:
+        return
+    store: ReminderStore = context.application.bot_data["reminder_store"]
+    reminders = store.list_owned(chat.id, sender.id)
+    if not reminders:
+        await reply_text_with_retry(message, "У тебя нет сохранённых напоминаний в этом чате.")
+        return
+    lines = ["Твои напоминания:"]
+    for reminder in reminders[:20]:
+        try:
+            due_at = datetime.fromisoformat(str(reminder.get("due_at") or ""))
+            due_text = due_at.strftime("%d.%m.%Y %H:%M")
+        except ValueError:
+            due_text = "неизвестное время"
+        status = str(reminder.get("status") or "unknown")
+        text = " ".join(str(reminder.get("text") or "").split())[:180]
+        lines.append(
+            f"{str(reminder.get('id') or '')[:8]} — {due_text} — {status} — {text}"
+        )
+    if len(reminders) > 20:
+        lines.append(f"Ещё напоминаний: {len(reminders) - 20}")
+    lines.append("Отмена: /cancel ID. Перенос: /snooze ID минуты.")
+    await reply_text_with_retry(message, "\n".join(lines))
+
+
+async def cancel_reminder_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    sender = update.effective_user
+    if not message or not chat or not sender:
+        return
+    identifier = context.args[0].strip() if context.args else ""
+    if not identifier:
+        await reply_text_with_retry(message, "Использование: /cancel ID")
+        return
+    store: ReminderStore = context.application.bot_data["reminder_store"]
+    if not store.cancel_owned(chat.id, sender.id, identifier):
+        await reply_text_with_retry(message, "Напоминание с таким ID не найдено.")
+        return
+    await reply_text_with_retry(message, "Напоминание отменено.")
+
+
+async def snooze_reminder_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    sender = update.effective_user
+    if not message or not chat or not sender:
+        return
+    if len(context.args) < 2:
+        await reply_text_with_retry(message, "Использование: /snooze ID минуты")
+        return
+    try:
+        minutes = int(context.args[1])
+    except ValueError:
+        minutes = 0
+    if not 1 <= minutes <= 10_080:
+        await reply_text_with_retry(message, "Укажи от 1 до 10080 минут.")
+        return
+    store: ReminderStore = context.application.bot_data["reminder_store"]
+    service: ReplyService = context.application.bot_data["reply_service"]
+    due_at = timezone_now(
+        service.memory.user_timezone(sender.id, service.settings.timezone)
+    ) + timedelta(minutes=minutes)
+    reminder = store.snooze_owned(chat.id, sender.id, context.args[0], due_at)
+    if reminder is None:
+        await reply_text_with_retry(message, "Напоминание с таким ID не найдено.")
+        return
+    await reply_text_with_retry(
+        message,
+        "Напоминание перенесено на " + due_at.strftime("%d.%m.%Y %H:%M") + ".",
+    )
+
+
+async def vacancies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    sender_user = update.effective_user
+    if not message or not chat or not sender_user:
+        return
+    service: ReplyService = context.application.bot_data["reply_service"]
+    if chat.type != "private" or not is_bot_owner(service.settings, sender_user.id):
+        await reply_text_with_retry(message, "Команда доступна только владельцу в личном чате.")
+        return
+    monitor: VacancyMonitor = context.application.bot_data["vacancy_monitor"]
+    action = str(context.args[0]).lower() if context.args else "status"
+
+    if action in {"status", "статус"}:
+        await reply_text_with_retry(message, monitor.status_text())
+        return
+    if action in {"off", "pause", "выкл"}:
+        monitor.store.set_paused(True)
+        await reply_text_with_retry(message, "Мониторинг вакансий поставлен на паузу.")
+        return
+    if action in {"on", "resume", "вкл"}:
+        monitor.store.set_paused(False)
+        await reply_text_with_retry(message, "Мониторинг вакансий включён.")
+        return
+    if action in {"check", "проверить"}:
+        vacancy_task = context.application.bot_data.get("vacancy_task")
+        if (
+            isinstance(vacancy_task, asyncio.Task)
+            and not vacancy_task.done()
+            and context.application.bot_data.get("vacancy_lock_conflict")
+        ):
+            await reply_text_with_retry(
+                message,
+                "Проверкой управляет отдельный запущенный процесс. Сначала останови его, чтобы не получить дубли.",
+            )
+            return
+
+        temporary_lock: socket.socket | None = None
+        if not isinstance(context.application.bot_data.get("vacancy_instance_lock"), socket.socket):
+            temporary_lock = acquire_vacancy_instance_lock()
+            if temporary_lock is None:
+                await reply_text_with_retry(
+                    message,
+                    "Проверкой управляет другой запущенный процесс. Повтори после его остановки.",
+                )
+                return
+
+        async def target_sender(chat_id: int, text: str) -> None:
+            await send_vacancy_message(context.application, chat_id, text)
+
+        try:
+            total, matches, new_count = await monitor.check(
+                target_sender,
+                force_status=True,
+            )
+        except Exception:
+            LOGGER.exception("Manual vacancy check failed")
+            await reply_text_with_retry(message, "Проверка вакансий завершилась ошибкой.")
+            return
+        finally:
+            if temporary_lock is not None:
+                temporary_lock.close()
+        await reply_text_with_retry(
+            message,
+            f"Проверка завершена: получено {total}, подходит {matches}, новых отправлено {new_count}.",
+        )
+        return
+    if action in {"show", "показать"}:
+        try:
+            matches, total = await monitor.current()
+        except Exception:
+            LOGGER.exception("Vacancy preview failed")
+            await reply_text_with_retry(message, "Не удалось получить вакансии.")
+            return
+        await reply_text_with_retry(
+            message,
+            f"Проверено {total}, подходит {len(matches)}. Показываю первые 10.",
+        )
+        for vacancy in matches[:10]:
+            await send_vacancy_message(context.application, chat.id, format_vacancy(vacancy))
+        return
+    await reply_text_with_retry(
+        message,
+        "Использование: /vacancies status|check|show|on|off",
     )
 
 
@@ -3020,6 +3977,20 @@ async def _process_incoming_messages(
     sender = message.from_user
     user_id = sender.id if sender else 0
     user_name = (sender.full_name or sender.username or str(user_id)) if sender else "unknown"
+    limiter = context.application.bot_data.get("request_rate_limiter")
+    if isinstance(limiter, RequestRateLimiter):
+        allowed, retry_after = limiter.allow(
+            (chat.id, user_id),
+            asyncio.get_running_loop().time(),
+        )
+        if not allowed:
+            LOGGER.warning("Rate limit reached for chat=%s user=%s", chat.id, user_id)
+            if is_private_chat or explicit_group_call:
+                await reply_text_with_retry(
+                    message,
+                    f"Слишком много запросов подряд. Попробуй через {retry_after} сек."
+                )
+            return
     prepared, reply_data = await run_with_typing(
         bot,
         chat.id,
@@ -3073,30 +4044,36 @@ async def _process_incoming_messages(
     tool_status_messages: list[Message] = []
 
     async def send_tool_status(status_text: str) -> None:
-        status_message = await message.reply_text(status_text)
+        status_message = await reply_text_with_retry(message, status_text)
         tool_status_messages.append(status_message)
 
     try:
         answer = await run_with_typing(
             bot,
             chat.id,
-            service.reply(
-                chat.id,
-                user_id,
-                user_name,
-                user_text,
-                mode,
-                chat.type,
-                tool_status_callback=send_tool_status,
-                images=prepared.images,
-                allow_tools=prepared.allow_tools,
+            run_limited(
+                context.application.bot_data.get("request_semaphore"),
+                service.reply(
+                    chat.id,
+                    user_id,
+                    user_name,
+                    user_text,
+                    mode,
+                    chat.type,
+                    tool_status_callback=send_tool_status,
+                    images=prepared.images,
+                    allow_tools=prepared.allow_tools,
+                ),
             ),
         )
-        await message.reply_text(answer)
+        await reply_text_with_retry(message, answer)
     finally:
         for status_message in tool_status_messages:
             try:
-                await status_message.delete()
+                await telegram_request_with_retry(
+                    status_message.delete,
+                    "temporary status deletion",
+                )
             except Exception:
                 LOGGER.warning(
                     "Could not delete tool status message %s",
@@ -3184,6 +4161,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     LOGGER.error("Unhandled Telegram error", exc_info=context.error)
+    service: ReplyService | None = context.application.bot_data.get("reply_service")
+    if not isinstance(service, ReplyService) or not service.settings.bot_owner_ids:
+        return
+    error = context.error
+    error_type = type(error).__name__ if error else "UnknownError"
+    now = asyncio.get_running_loop().time()
+    signature = error_type + ":" + str(error)[:160]
+    previous = context.application.bot_data.get("last_error_notice")
+    if (
+        isinstance(previous, tuple)
+        and len(previous) == 2
+        and previous[0] == signature
+        and isinstance(previous[1], (int, float))
+        and now - float(previous[1]) < 600
+    ):
+        return
+    context.application.bot_data["last_error_notice"] = (signature, now)
+    for owner_id in service.settings.bot_owner_ids:
+        try:
+            await telegram_request_with_retry(
+                lambda owner_id=owner_id: context.application.bot.send_message(
+                    chat_id=owner_id,
+                    text=(
+                        f"Ошибка обработчика Telegram: {error_type}. "
+                        "Бот продолжает работу; подробности записаны в локальный лог."
+                    ),
+                ),
+                "error notification",
+            )
+        except Exception:
+            LOGGER.exception("Could not notify owner %s about Telegram error", owner_id)
 
 
 def build_application(settings: Settings) -> Application:
@@ -3191,7 +4199,7 @@ def build_application(settings: Settings) -> Application:
         "connect_timeout": settings.telegram_timeout,
         "read_timeout": settings.telegram_timeout,
         "write_timeout": settings.telegram_timeout,
-        "pool_timeout": settings.telegram_timeout,
+        "pool_timeout": min(10.0, settings.telegram_timeout),
     }
     get_updates_options = {
         **request_options,
@@ -3206,8 +4214,18 @@ def build_application(settings: Settings) -> Application:
         ApplicationBuilder()
         .token(settings.telegram_token)
         .concurrent_updates(8)
-        .request(HTTPXRequest(**request_options))
-        .get_updates_request(HTTPXRequest(**get_updates_options))
+        .request(
+            HTTPXRequest(
+                connection_pool_size=TELEGRAM_REQUEST_POOL_SIZE,
+                **request_options,
+            )
+        )
+        .get_updates_request(
+            HTTPXRequest(
+                connection_pool_size=TELEGRAM_UPDATES_POOL_SIZE,
+                **get_updates_options,
+            )
+        )
         .post_init(start_background_tasks)
         .post_shutdown(stop_background_tasks)
         .build()
@@ -3216,13 +4234,36 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["reminder_store"] = reminder_store
     reply_service = ReplyService(settings, reminder_store)
     application.bot_data["reply_service"] = reply_service
+    vacancy_settings = load_vacancy_monitor_settings(
+        project_path(settings.vacancy_config_file)
+    )
+    application.bot_data["vacancy_monitor"] = VacancyMonitor(
+        vacancy_settings,
+        Path(__file__).resolve().parent,
+    )
     application.bot_data["media_processor"] = MediaProcessor(reply_service)
     application.bot_data["media_groups"] = {}
     application.bot_data["media_group_tasks"] = {}
     application.bot_data["chat_turn_locks"] = {}
+    application.bot_data["request_rate_limiter"] = RequestRateLimiter(
+        settings.request_rate_limit_count,
+        settings.request_rate_limit_window_seconds,
+    )
+    application.bot_data["request_semaphore"] = asyncio.Semaphore(
+        settings.max_concurrent_requests
+    )
+    application.bot_data["started_at"] = datetime.now(dt_timezone.utc)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("memory", memory_command))
+    application.add_handler(CommandHandler("forget", forget_command))
+    application.add_handler(CommandHandler("timezone", timezone_command))
     application.add_handler(CommandHandler(["log", "journal"], api_log_command))
+    application.add_handler(CommandHandler("reminders", list_reminders_command))
+    application.add_handler(CommandHandler("cancel", cancel_reminder_command))
+    application.add_handler(CommandHandler("snooze", snooze_reminder_command))
+    application.add_handler(CommandHandler("vacancies", vacancies_command))
     application.add_handler(
         MessageHandler(
             filters.TEXT & filters.Regex(r"^\s*/н(?:@[A-Za-z0-9_]+)?(?:\s+.*)?$"),
@@ -3272,6 +4313,15 @@ def main() -> None:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    migrate_legacy_runtime_files(
+        Path(__file__).resolve().parent,
+        (
+            project_path(settings.context_history_file),
+            project_path(settings.memory_file),
+            project_path(settings.reminders_file),
+            project_path(settings.api_journal_file),
+        ),
+    )
     instance_lock = acquire_instance_lock()
     if instance_lock is None:
         return
