@@ -140,6 +140,7 @@ class Settings:
     vacancy_user_agent: str
     vacancy_target_chat_id: int
     vacancy_always_on: bool
+    vacancy_autostart: bool
     log_level: str
     api_journal_file: str
     api_journal_max_entries: int
@@ -266,6 +267,7 @@ class Settings:
             ),
             vacancy_target_chat_id=integer("vacancy_target_chat_id", 0),
             vacancy_always_on=boolean("vacancy_always_on", False),
+            vacancy_autostart=boolean("vacancy_autostart", True),
             log_level=text("log_level", "INFO").upper(),
             api_journal_file=text("api_journal_file", "api_journal.jsonl")
             or "api_journal.jsonl",
@@ -2235,8 +2237,19 @@ async def reminder_loop(application: Application) -> None:
 
 
 async def start_background_tasks(application: Application) -> None:
-    application.bot_data["reminder_task"] = asyncio.create_task(reminder_loop(application))
-    application.bot_data["vacancy_task"] = asyncio.create_task(vacancy_loop(application))
+    application.bot_data["reminder_task"] = asyncio.create_task(
+        reminder_loop(application),
+        name="reminder-loop",
+    )
+    service: VacancyService = application.bot_data["vacancy_service"]
+    if service.settings.vacancy_autostart:
+        application.bot_data["vacancy_task"] = asyncio.create_task(
+            vacancy_loop(application),
+            name="vacancy-loop",
+        )
+        LOGGER.info("Vacancy parser autostarted with Telegram bot")
+    else:
+        LOGGER.info("Vacancy parser autostart is disabled")
 
 
 async def stop_background_tasks(application: Application) -> None:

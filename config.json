@@ -44,6 +44,7 @@
   "vacancy_user_agent": "TopTgBot/1.0 (vacancy parser; contact the project owner)",
   "vacancy_target_chat_id": 1863437123,
   "vacancy_always_on": true,
+  "vacancy_autostart": true,
   "log_level": "INFO",
   "api_journal_file": "api_journal.jsonl",
   "api_journal_max_entries": 200,
