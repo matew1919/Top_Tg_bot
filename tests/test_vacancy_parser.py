@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,9 +35,11 @@ def parser_config(vacancy_filter: VacancyFilter) -> VacancyConfig:
 class FakeClient:
     def __init__(self, responses: dict[str, httpx.Response]) -> None:
         self.responses = responses
+        self.calls: list[str] = []
 
     async def get(self, url: str, **kwargs: object) -> httpx.Response:
         del kwargs
+        self.calls.append(url)
         return self.responses[url]
 
 
@@ -90,7 +93,11 @@ class VacancyParserTests(unittest.IsolatedAsyncioTestCase):
                 HH_SEARCH_URL: httpx.Response(200, text=html, request=search_request),
             }
         )
-        parser = VacancyParser(parser_config(VacancyFilter(keywords=("python",))), None)
+        config = replace(
+            parser_config(VacancyFilter(keywords=("python",))),
+            hh_api_enabled=True,
+        )
+        parser = VacancyParser(config, None)
 
         result = await parser._fetch_hh(client)
 
@@ -98,6 +105,23 @@ class VacancyParserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[0].external_id, "123")
         self.assertEqual(result[0].company, "Acme")
         self.assertTrue(result[0].remote)
+
+    async def test_hh_api_is_skipped_when_disabled(self) -> None:
+        html = """
+        <div data-qa="vacancy-serp__vacancy">
+          <a data-qa="serp-item__title" href="/vacancy/321">Python Developer</a>
+        </div>
+        """
+        request = httpx.Request("GET", HH_SEARCH_URL)
+        client = FakeClient(
+            {HH_SEARCH_URL: httpx.Response(200, text=html, request=request)}
+        )
+        parser = VacancyParser(parser_config(VacancyFilter(keywords=("python",))), None)
+
+        result = await parser._fetch_hh(client)
+
+        self.assertEqual([item.external_id for item in result], ["321"])
+        self.assertEqual(client.calls, [HH_SEARCH_URL])
 
     async def test_habr_html_parser_extracts_vacancy_card(self) -> None:
         html = """
@@ -136,4 +160,3 @@ class VacancyParserTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -33,6 +33,7 @@ class VacancyMonitorSettings:
     source_proxy_url: str | None
     send_status_every_check: bool
     max_notifications_per_check: int
+    source_failure_alert_after: int = 3
 
 
 def _strings(value: object) -> tuple[str, ...]:
@@ -83,6 +84,14 @@ def load_vacancy_monitor_settings(path: Path) -> VacancyMonitorSettings:
             raw.get("user_agent")
             or "TopTgBotVacancyMonitor/2.0 (contact the project owner)"
         ),
+        hh_api_enabled=_boolean(raw.get("hh_api_enabled")),
+        request_timeout_seconds=max(
+            2.0, min(60.0, float(raw.get("request_timeout_seconds") or 8.0))
+        ),
+        source_attempts=max(1, min(5, int(raw.get("source_attempts") or 3))),
+        source_retry_base_seconds=max(
+            0.1, min(10.0, float(raw.get("source_retry_base_seconds") or 1.0))
+        ),
     )
     return VacancyMonitorSettings(
         enabled=enabled,
@@ -93,7 +102,20 @@ def load_vacancy_monitor_settings(path: Path) -> VacancyMonitorSettings:
         max_notifications_per_check=min(
             50, max(1, int(raw.get("max_notifications_per_check") or 20))
         ),
+        source_failure_alert_after=max(
+            1, min(20, int(raw.get("source_failure_alert_after") or 3))
+        ),
     )
+
+
+def _parse_health_datetime(value: object) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 class VacancyMonitor:
@@ -108,13 +130,15 @@ class VacancyMonitor:
             store_path = project_directory / store_path
         self.store = VacancyStore(store_path)
         self._check_lock = asyncio.Lock()
-        self.last_started_at: datetime | None = None
-        self.last_finished_at: datetime | None = None
+        health = self.store.health
+        self.last_started_at = _parse_health_datetime(health.get("last_started_at"))
+        self.last_finished_at = _parse_health_datetime(health.get("last_finished_at"))
+        self.last_success_at = _parse_health_datetime(health.get("last_success_at"))
         self.next_check_at: datetime | None = None
-        self.last_total = 0
-        self.last_matches = 0
-        self.last_new = 0
-        self.last_error: str | None = None
+        self.last_total = int(health.get("last_total") or 0)
+        self.last_matches = int(health.get("last_matches") or 0)
+        self.last_new = int(health.get("last_new") or 0)
+        self.last_error = str(health.get("last_error") or "") or None
 
     @property
     def enabled(self) -> bool:
@@ -127,12 +151,112 @@ class VacancyMonitor:
                 vacancies
             )
 
+    def _update_source_health(self) -> None:
+        health = dict(self.store.health)
+        sources_value = health.get("sources", {})
+        sources = dict(sources_value) if isinstance(sources_value, dict) else {}
+        now = datetime.now(timezone.utc).isoformat()
+        configured = {
+            "habr" if source.strip().lower() == "habr_career" else source.strip().lower()
+            for source in self.settings.parser_config.sources
+        }
+        for source in configured:
+            previous_value = sources.get(source, {})
+            previous = dict(previous_value) if isinstance(previous_value, dict) else {}
+            if source in self.parser.last_source_errors:
+                previous["consecutive_failures"] = int(
+                    previous.get("consecutive_failures") or 0
+                ) + 1
+                previous["last_error"] = self.parser.last_source_errors[source]
+                previous["last_error_at"] = now
+            elif source in self.parser.last_source_counts:
+                previous["consecutive_failures"] = 0
+                previous["last_error"] = None
+                previous["last_success_at"] = now
+                previous["last_count"] = self.parser.last_source_counts[source]
+            sources[source] = previous
+        health["sources"] = sources
+        self.store.update_health(health)
+
+    def _record_check_result(self, *, success: bool) -> None:
+        now = datetime.now(timezone.utc)
+        self.last_finished_at = now
+        health = dict(self.store.health)
+        health.update(
+            {
+                "last_started_at": (
+                    self.last_started_at.isoformat() if self.last_started_at else None
+                ),
+                "last_finished_at": now.isoformat(),
+                "last_total": self.last_total,
+                "last_matches": self.last_matches,
+                "last_new": self.last_new,
+                "last_error": self.last_error,
+            }
+        )
+        if success:
+            health["last_success_at"] = now.isoformat()
+            health["consecutive_failures"] = 0
+            self.last_success_at = now
+        else:
+            health["consecutive_failures"] = int(
+                health.get("consecutive_failures") or 0
+            ) + 1
+        self.store.update_health(health)
+
+    async def _deliver_health_notices(self, sender: SendMessage) -> None:
+        health = dict(self.store.health)
+        sources_value = health.get("sources", {})
+        sources = dict(sources_value) if isinstance(sources_value, dict) else {}
+        threshold = self.settings.source_failure_alert_after
+        messages: list[str] = []
+        changed = False
+        for source, raw in sources.items():
+            if not isinstance(raw, dict):
+                continue
+            state = dict(raw)
+            failures = int(state.get("consecutive_failures") or 0)
+            alerted = bool(state.get("alert_active"))
+            if failures >= threshold and not alerted:
+                messages.append(
+                    f"Источник вакансий {source} недоступен уже {failures} проверки подряд. Остальные источники продолжают работать.",
+                )
+                state["alert_active"] = True
+                changed = True
+            elif failures == 0 and alerted:
+                messages.append(f"Источник вакансий {source} снова работает.")
+                state["alert_active"] = False
+                changed = True
+            sources[source] = state
+
+        failures = int(health.get("consecutive_failures") or 0)
+        monitor_alerted = bool(health.get("monitor_alert_active"))
+        if failures >= threshold and not monitor_alerted:
+            messages.append(
+                f"Мониторинг вакансий не завершился уже {failures} раза подряд. Автоматические попытки продолжаются.",
+            )
+            health["monitor_alert_active"] = True
+            changed = True
+        elif failures == 0 and monitor_alerted:
+            messages.append(
+                "Мониторинг вакансий восстановился и снова выполняет проверки."
+            )
+            health["monitor_alert_active"] = False
+            changed = True
+        if changed:
+            await sender(self.settings.target_chat_id, "\n".join(messages))
+            health["sources"] = sources
+            self.store.update_health(health)
+
     async def check(self, sender: SendMessage, *, force_status: bool = False) -> tuple[int, int, int]:
         async with self._check_lock:
             self.last_started_at = datetime.now(timezone.utc)
             self.last_error = None
+            source_health_updated = False
             try:
                 vacancies = await self.parser.fetch()
+                self._update_source_health()
+                source_health_updated = True
                 matches = filter_vacancies(
                     vacancies, self.settings.parser_config.filter
                 )
@@ -168,7 +292,6 @@ class VacancyMonitor:
                 should_report = (
                     force_status
                     or self.settings.send_status_every_check
-                    or bool(source_errors)
                 )
                 if should_report:
                     if baseline_created:
@@ -186,31 +309,41 @@ class VacancyMonitor:
                         self.settings.target_chat_id,
                         f"{result}\nПроверено: {len(vacancies)}. Подходит: {len(matches)}.{source_note}",
                     )
+                self._record_check_result(success=True)
+                try:
+                    await self._deliver_health_notices(sender)
+                except Exception:
+                    LOGGER.exception("Could not deliver vacancy health notification")
                 return len(vacancies), len(matches), sent
             except Exception as error:
                 self.last_error = (str(error) or type(error).__name__)[:300]
+                if not source_health_updated:
+                    self._update_source_health()
+                self._record_check_result(success=False)
+                try:
+                    await self._deliver_health_notices(sender)
+                except Exception:
+                    LOGGER.exception("Could not deliver vacancy health notification")
                 raise
-            finally:
-                self.last_finished_at = datetime.now(timezone.utc)
 
     async def run(self, sender: SendMessage) -> None:
+        loop = asyncio.get_running_loop()
+        next_deadline = loop.time()
         while True:
             if self.enabled:
                 try:
                     await self.check(sender)
                 except Exception:
                     LOGGER.exception("Vacancy check failed")
-                    try:
-                        await sender(
-                            self.settings.target_chat_id,
-                            "Проверка вакансий не выполнена. Автоматическая проверка продолжит работу.",
-                        )
-                    except Exception:
-                        LOGGER.exception("Could not deliver vacancy failure notification")
-            self.next_check_at = datetime.now(timezone.utc) + timedelta(
-                seconds=self.settings.parser_config.poll_seconds
-            )
-            await asyncio.sleep(self.settings.parser_config.poll_seconds)
+            interval = self.settings.parser_config.poll_seconds
+            next_deadline += interval
+            now = loop.time()
+            if next_deadline <= now:
+                missed = int((now - next_deadline) // interval) + 1
+                next_deadline += missed * interval
+            delay = max(0.0, next_deadline - now)
+            self.next_check_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+            await asyncio.sleep(delay)
 
     def status_text(self) -> str:
         state = "включён" if self.enabled else "на паузе"
@@ -225,13 +358,36 @@ class VacancyMonitor:
             else "не запланирована"
         )
         error = f"\nПоследняя ошибка: {self.last_error}" if self.last_error else ""
+        last_success = (
+            self.last_success_at.astimezone().strftime("%d.%m.%Y %H:%M:%S")
+            if self.last_success_at
+            else "ещё не было"
+        )
+        health = self.store.health
+        sources_value = health.get("sources", {})
+        source_lines: list[str] = []
+        if isinstance(sources_value, dict):
+            for source in sorted(sources_value):
+                source_state = sources_value[source]
+                if not isinstance(source_state, dict):
+                    continue
+                failures = int(source_state.get("consecutive_failures") or 0)
+                count = int(source_state.get("last_count") or 0)
+                source_lines.append(
+                    f"{source}: {count}, ошибок подряд {failures}"
+                )
+        sources_status = (
+            "\nПо источникам: " + "; ".join(source_lines) if source_lines else ""
+        )
         return (
             f"Мониторинг вакансий: {state}\n"
             f"Получатель: {self.settings.target_chat_id}\n"
             f"Источники: {', '.join(self.settings.parser_config.sources)}\n"
             f"Интервал: {self.settings.parser_config.poll_seconds // 60} мин.\n"
             f"Последняя проверка: {last_check}\n"
+            f"Последняя успешная: {last_success}\n"
             f"Следующая проверка: {next_check}\n"
             f"Последний результат: проверено {self.last_total}, подходит {self.last_matches}, новых {self.last_new}"
+            f"{sources_status}"
             f"{error}"
         )

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
@@ -114,6 +115,10 @@ class VacancyConfig:
     store_file: str
     first_run_notify: bool
     user_agent: str
+    hh_api_enabled: bool = False
+    request_timeout_seconds: float = 8.0
+    source_attempts: int = 3
+    source_retry_base_seconds: float = 1.0
 
 
 def _clean(value: object) -> str:
@@ -155,6 +160,7 @@ class VacancyStore:
             "subscriptions": [],
             "seen": {},
             "baseline_done": False,
+            "health": {},
         }
         self._load()
 
@@ -172,6 +178,8 @@ class VacancyStore:
             self.data["subscriptions"] = []
         if not isinstance(self.data.get("seen"), dict):
             self.data["seen"] = {}
+        if not isinstance(self.data.get("health"), dict):
+            self.data["health"] = {}
 
     def _save(self) -> None:
         atomic_write_text(
@@ -232,6 +240,15 @@ class VacancyStore:
         self.data["paused"] = bool(paused)
         self._save()
 
+    @property
+    def health(self) -> dict[str, object]:
+        value = self.data.get("health", {})
+        return value if isinstance(value, dict) else {}
+
+    def update_health(self, health: dict[str, object]) -> None:
+        self.data["health"] = health
+        self._save()
+
 
 class VacancyParser:
     def __init__(self, config: VacancyConfig, proxy_url: str | None = None) -> None:
@@ -250,34 +267,83 @@ class VacancyParser:
         }
         async with httpx.AsyncClient(
             headers=headers,
-            timeout=25,
+            timeout=self.config.request_timeout_seconds,
             follow_redirects=True,
             proxy=self.proxy_url,
         ) as client:
-            result: list[Vacancy] = []
-            successful_sources = 0
+            tasks: list[tuple[str, asyncio.Task[list[Vacancy]]]] = []
             for source in self.config.sources:
                 normalized = source.strip().lower()
-                try:
-                    if normalized == "hh":
-                        fetched = await self._fetch_hh(client)
-                    elif normalized in {"habr", "habr_career"}:
-                        fetched = await self._fetch_habr(client)
-                    else:
-                        LOGGER.warning("Unknown vacancy source: %s", source)
-                        self.last_source_errors[normalized or str(source)] = "unknown source"
+                if normalized not in {"hh", "habr", "habr_career"}:
+                    LOGGER.warning("Unknown vacancy source: %s", source)
+                    self.last_source_errors[normalized or str(source)] = "unknown source"
+                    continue
+                if normalized == "habr_career":
+                    normalized = "habr"
+                tasks.append(
+                    (
+                        normalized,
+                        asyncio.create_task(
+                            self._fetch_source_with_retry(normalized, client),
+                            name=f"vacancy-source-{normalized}",
+                        ),
+                    )
+                )
+
+            result: list[Vacancy] = []
+            successful_sources = 0
+            if tasks:
+                outcomes = await asyncio.gather(
+                    *(task for _, task in tasks),
+                    return_exceptions=True,
+                )
+                for (source, _), outcome in zip(tasks, outcomes):
+                    if isinstance(outcome, asyncio.CancelledError):
+                        raise outcome
+                    if isinstance(outcome, BaseException):
+                        self.last_source_errors[source] = (
+                            str(outcome) or type(outcome).__name__
+                        )[:300]
+                        LOGGER.error(
+                            "Vacancy source failed after retries: %s: %s",
+                            source,
+                            self.last_source_errors[source],
+                        )
                         continue
-                    result.extend(fetched)
-                    self.last_source_counts[normalized] = len(fetched)
+                    result.extend(outcome)
+                    self.last_source_counts[source] = len(outcome)
                     successful_sources += 1
-                except Exception as error:
-                    self.last_source_errors[normalized] = (
-                        str(error) or type(error).__name__
-                    )[:300]
-                    LOGGER.exception("Vacancy source failed: %s", source)
             if self.config.sources and successful_sources == 0:
                 raise RuntimeError("All vacancy sources failed")
             return result
+
+    async def _fetch_source_with_retry(
+        self,
+        source: str,
+        client: httpx.AsyncClient,
+    ) -> list[Vacancy]:
+        attempts = max(1, self.config.source_attempts)
+        for attempt in range(attempts):
+            try:
+                if source == "hh":
+                    return await self._fetch_hh(client)
+                return await self._fetch_habr(client)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if attempt + 1 >= attempts:
+                    raise
+                delay = min(8.0, self.config.source_retry_base_seconds * (2**attempt))
+                LOGGER.warning(
+                    "Vacancy source %s failed (%s/%s): %s; retrying in %.1fs",
+                    source,
+                    attempt + 1,
+                    attempts,
+                    str(error) or type(error).__name__,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+        raise RuntimeError(f"Vacancy source retry loop ended unexpectedly: {source}")
 
     async def _fetch_hh(self, client: httpx.AsyncClient) -> list[Vacancy]:
         params: dict[str, object] = {
@@ -291,6 +357,8 @@ class VacancyParser:
             params["text"] = " OR ".join(keywords)
         if self.config.filter.max_age_hours > 0:
             params["period"] = min(30, max(1, (self.config.filter.max_age_hours + 23) // 24))
+        if not self.config.hh_api_enabled:
+            return await self._fetch_hh_html(client, keywords)
         try:
             response = await client.get(HH_API_URL, params=params)
             response.raise_for_status()

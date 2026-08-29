@@ -17,6 +17,7 @@ before connecting an AI provider.
 from __future__ import annotations
 
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import asyncio
@@ -30,11 +31,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
 from typing import Awaitable, Callable, TypeVar
+from urllib.parse import urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from gigachat import GigaChat
+import httpx
 from openai import OpenAI
 from telegram import Message, Update
 from telegram.constants import ChatAction
@@ -155,6 +158,9 @@ class Settings:
     timezone: str
     reminder_poll_seconds: int
     log_level: str
+    log_file: str
+    log_max_bytes: int
+    log_backup_count: int
     api_journal_file: str
     api_journal_max_entries: int
     api_journal_enabled: bool
@@ -306,6 +312,10 @@ class Settings:
             timezone=text("timezone", "Europe/Moscow") or "Europe/Moscow",
             reminder_poll_seconds=max(5, integer("reminder_poll_seconds", 15)),
             log_level=text("log_level", "INFO").upper(),
+            log_file=text("log_file", "runtime/bot_runtime.log")
+            or "runtime/bot_runtime.log",
+            log_max_bytes=max(100_000, integer("log_max_bytes", 5_000_000)),
+            log_backup_count=max(1, min(20, integer("log_backup_count", 5))),
             api_journal_file=text("api_journal_file", "runtime/api_journal.jsonl")
             or "runtime/api_journal.jsonl",
             api_journal_max_entries=max(1, integer("api_journal_max_entries", 200)),
@@ -1643,6 +1653,14 @@ class ReplyService:
                 base_url=settings.vsegpt_base_url,
                 timeout=settings.gigachat_timeout,
                 max_retries=0,
+                http_client=httpx.Client(
+                    timeout=settings.gigachat_timeout,
+                    limits=httpx.Limits(
+                        max_connections=10,
+                        max_keepalive_connections=4,
+                        keepalive_expiry=30.0,
+                    ),
+                ),
             )
             if settings.ai_provider == "vsegpt" and settings.vsegpt_api_key
             else None
@@ -1666,6 +1684,14 @@ class ReplyService:
             self._create_reminder_tool,
             search_proxy=settings.search_proxy_url,
         )
+
+    async def close(self) -> None:
+        """Release persistent network clients during a graceful shutdown."""
+
+        for client in (self.vsegpt_client, self.gigachat_client):
+            close = getattr(client, "close", None)
+            if callable(close):
+                await asyncio.to_thread(close)
 
     def _save_history(self) -> None:
         self.history_store.save(self.history, self.compacted_history)
@@ -3377,6 +3403,9 @@ async def stop_background_tasks(application: Application) -> None:
     vacancy_lock = application.bot_data.get("vacancy_instance_lock")
     if isinstance(vacancy_lock, socket.socket):
         vacancy_lock.close()
+    service = application.bot_data.get("reply_service")
+    if isinstance(service, ReplyService):
+        await service.close()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4208,7 +4237,10 @@ def build_application(settings: Settings) -> Application:
     if settings.telegram_proxy_url:
         request_options["proxy"] = settings.telegram_proxy_url
         get_updates_options["proxy"] = settings.telegram_proxy_url
-        LOGGER.info("Telegram Bot API uses proxy %s", settings.telegram_proxy_url)
+        LOGGER.info(
+            "Telegram Bot API uses proxy %s",
+            safe_url_for_log(settings.telegram_proxy_url),
+        )
 
     application = (
         ApplicationBuilder()
@@ -4304,13 +4336,60 @@ def acquire_instance_lock() -> socket.socket | None:
     return lock
 
 
-def main() -> None:
-    load_dotenv()
-    settings = Settings.from_env()
-    logging.basicConfig(
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        level=settings.log_level,
+def safe_url_for_log(value: str) -> str:
+    """Describe a service URL without exposing credentials or query values."""
+
+    try:
+        parsed = urlsplit(value)
+        if not parsed.scheme or not parsed.hostname:
+            return "configured"
+        host = parsed.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://{host}{port}"
+    except (TypeError, ValueError):
+        return "configured"
+
+
+def configure_logging(settings: Settings) -> None:
+    """Write operational logs both to the console and rotating local files."""
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
     )
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(settings.log_level)
+
+    console_enabled = os.getenv("BOT_LOG_CONSOLE", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if console_enabled:
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        root_logger.addHandler(console_handler)
+
+    log_path = project_path(settings.log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = RotatingFileHandler(
+        log_path,
+        maxBytes=settings.log_max_bytes,
+        backupCount=settings.log_backup_count,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+
+
+def main() -> None:
+    environment_file = os.getenv("BOT_ENV_FILE", "").strip()
+    load_dotenv(environment_file or None)
+    settings = Settings.from_env()
+    configure_logging(settings)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     migrate_legacy_runtime_files(

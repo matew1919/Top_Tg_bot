@@ -76,6 +76,52 @@ class VacancyMonitorTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(monitor.store.is_seen(item.key))
             self.assertIn("telegram unavailable", monitor.last_error or "")
 
+    async def test_source_alert_is_throttled_and_recovery_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            monitor_settings = settings()
+            monitor_settings = VacancyMonitorSettings(
+                **{
+                    **monitor_settings.__dict__,
+                    "parser_config": VacancyConfig(
+                        **{
+                            **monitor_settings.parser_config.__dict__,
+                            "sources": ("hh", "habr"),
+                        }
+                    ),
+                }
+            )
+            monitor = VacancyMonitor(monitor_settings, Path(directory))
+            monitor.parser.fetch = AsyncMock(return_value=[vacancy("1")])
+            monitor.parser.last_source_errors = {"habr": "timeout"}
+            monitor.parser.last_source_counts = {"hh": 1}
+            sender = AsyncMock()
+
+            for _ in range(3):
+                await monitor.check(sender)
+
+            self.assertEqual(sender.await_count, 1)
+            self.assertIn("3 проверки подряд", sender.await_args.args[1])
+
+            monitor.parser.last_source_errors = {}
+            monitor.parser.last_source_counts = {"hh": 1, "habr": 1}
+            await monitor.check(sender)
+
+            self.assertEqual(sender.await_count, 2)
+            self.assertIn("снова работает", sender.await_args.args[1])
+
+    async def test_health_survives_monitor_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            monitor = VacancyMonitor(settings(), project)
+            monitor.parser.fetch = AsyncMock(return_value=[vacancy("1")])
+
+            await monitor.check(AsyncMock())
+            restored = VacancyMonitor(settings(), project)
+
+            self.assertEqual(restored.last_total, 1)
+            self.assertEqual(restored.last_matches, 1)
+            self.assertIsNotNone(restored.last_success_at)
+
 
 if __name__ == "__main__":
     unittest.main()

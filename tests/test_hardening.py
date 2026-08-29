@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
-from bot import ApiJournal, ReplyService, RequestRateLimiter
+from bot import (
+    ApiJournal,
+    ReplyService,
+    RequestRateLimiter,
+    configure_logging,
+    safe_url_for_log,
+)
 from runtime_storage import atomic_write_text, load_json_object, migrate_legacy_runtime_files
 
 
@@ -72,6 +80,40 @@ class RateLimiterTests(unittest.TestCase):
         self.assertGreater(retry_after, 0)
         self.assertEqual(limiter.allow((1, 8), 102), (True, 0))
         self.assertEqual(limiter.allow((1, 7), 111), (True, 0))
+
+
+class LogPrivacyTests(unittest.TestCase):
+    def test_proxy_credentials_are_removed_from_log_description(self) -> None:
+        self.assertEqual(
+            safe_url_for_log("socks5://secret:password@127.0.0.1:10808/path?token=x"),
+            "socks5://127.0.0.1:10808",
+        )
+
+    def test_runtime_log_is_written_to_file_without_console(self) -> None:
+        root_logger = logging.getLogger()
+        old_handlers = list(root_logger.handlers)
+        old_level = root_logger.level
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "runtime.log"
+            settings = SimpleNamespace(
+                log_level="INFO",
+                log_file=str(log_path),
+                log_max_bytes=100_000,
+                log_backup_count=2,
+            )
+            try:
+                with patch.dict(os.environ, {"BOT_LOG_CONSOLE": "0"}):
+                    configure_logging(settings)
+                logging.getLogger("test-runtime-log").info("health check")
+                for handler in root_logger.handlers:
+                    handler.flush()
+                self.assertIn("health check", log_path.read_text(encoding="utf-8"))
+                self.assertEqual(len(root_logger.handlers), 1)
+            finally:
+                for handler in root_logger.handlers:
+                    handler.close()
+                root_logger.handlers[:] = old_handlers
+                root_logger.setLevel(old_level)
 
 
 class ConversationSafetyTests(unittest.IsolatedAsyncioTestCase):

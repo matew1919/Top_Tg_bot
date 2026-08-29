@@ -99,11 +99,12 @@ async def web_search(
         failures: list[str] = []
         for backend in ("brave", "duckduckgo", "google"):
             try:
-                raw_results = DDGS(proxy=proxy, timeout=8).text(
-                    query,
-                    max_results=5,
-                    backend=backend,
-                )
+                with DDGS(proxy=proxy, timeout=8) as search_client:
+                    raw_results = search_client.text(
+                        query,
+                        max_results=5,
+                        backend=backend,
+                    )
             except Exception as error:
                 failures.append(f"{backend}: {str(error) or type(error).__name__}")
                 continue
