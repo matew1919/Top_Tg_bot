@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -47,6 +48,10 @@ class ToolRegistry:
 
     @property
     def schemas(self) -> list[dict[str, object]]:
+        return self.schemas_for(self._tools)
+
+    def schemas_for(self, names: Iterable[str]) -> list[dict[str, object]]:
+        selected = {str(name) for name in names}
         return [
             {
                 "type": "function",
@@ -57,6 +62,7 @@ class ToolRegistry:
                 },
             }
             for name, tool in self._tools.items()
+            if name in selected
         ]
 
     async def execute(

@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from bot import (
     ApiJournal,
+    MemoryStore,
     ReplyService,
     RequestRateLimiter,
     configure_logging,
@@ -113,6 +114,51 @@ class ApiJournalPrivacyTests(unittest.TestCase):
                 for line in path.read_text(encoding="utf-8").splitlines()
             ]
             self.assertEqual(entries, [{"response": 2}, {"response": 3}])
+
+    def test_existing_journal_removes_intermediate_and_embedded_media(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "api.jsonl"
+            payload = "data:image/jpeg;base64," + "A" * 1000
+            entries = [
+                {"kind": "reply", "response": "", "messages": []},
+                {
+                    "kind": "reply",
+                    "response": "answer",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "image_url", "image_url": payload}],
+                        }
+                    ],
+                },
+            ]
+            path.write_text(
+                "\n".join(json.dumps(item) for item in entries) + "\n",
+                encoding="utf-8",
+            )
+
+            ApiJournal(str(path), max_entries=30, enabled=True, include_content=True)
+
+            raw = path.read_text(encoding="utf-8")
+            self.assertEqual(len(raw.splitlines()), 1)
+            self.assertNotIn("A" * 100, raw)
+            self.assertIn("data URL omitted", raw)
+
+
+class GroupMemorySelectionTests(unittest.TestCase):
+    def test_other_participant_memory_requires_name_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(str(Path(directory) / "memory.json"))
+            store.set_chat_type(-1, "group")
+            store.merge(-1, 1, "Алиса", ["общий факт"], ["любит чай"])
+            store.merge(-1, 2, "Борис", [], ["любит джаз"])
+
+            self.assertIn("общий факт", store.chat_context(-1))
+            self.assertEqual(store.referenced_user_context(-1, 1, "как дела?"), "")
+            self.assertIn(
+                "любит джаз",
+                store.referenced_user_context(-1, 1, "а что любит Борис?"),
+            )
 
 
 class RateLimiterTests(unittest.TestCase):
@@ -234,6 +280,27 @@ class ConversationSafetyTests(unittest.IsolatedAsyncioTestCase):
             [item["content"] for item in service.history[(-100, "general")]],
             ["keep me", "answer to 8"],
         )
+
+    def test_three_messages_from_one_member_keep_other_group_members(self) -> None:
+        service = object.__new__(ReplyService)
+        service.settings = SimpleNamespace(
+            group_context_limit=8,
+            soft_context_limit=8,
+            max_english_history_messages=4,
+        )
+        messages = [
+            {"role": "user", "content": "from other", "user_id": 2, "user_name": "Борис"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "one", "user_id": 1, "user_name": "Алиса"},
+            {"role": "assistant", "content": "answer one"},
+            {"role": "user", "content": "two", "user_id": 1, "user_name": "Алиса"},
+            {"role": "assistant", "content": "answer two"},
+            {"role": "user", "content": "three", "user_id": 1, "user_name": "Алиса"},
+        ]
+
+        result = service._api_messages(messages, 1, "general", False)
+
+        self.assertTrue(any("Борис" in item["content"] for item in result))
 
 
 if __name__ == "__main__":

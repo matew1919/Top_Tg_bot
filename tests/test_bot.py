@@ -113,6 +113,7 @@ class ToolFallbackTests(unittest.IsolatedAsyncioTestCase):
         )
         service.tools = SimpleNamespace(
             schemas=[],
+            schemas_for=lambda _names: [],
             execute=AsyncMock(
                 return_value=json.dumps(
                     {
@@ -125,6 +126,7 @@ class ToolFallbackTests(unittest.IsolatedAsyncioTestCase):
                 )
             ),
         )
+        service._record_vsegpt_final_reply = AsyncMock()
 
         with patch("bot.LOGGER.exception"):
             answer = await service._vsegpt_reply_with_tools(
@@ -143,6 +145,36 @@ class ToolFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Напоминание создано", answer)
         self.assertIn("25.08.2026 13:00", answer)
         service.tools.execute.assert_awaited_once()
+        self.assertEqual(service._vsegpt_chat.await_count, 2)
+        self.assertTrue(
+            all(
+                call.kwargs["record_journal"] is False
+                for call in service._vsegpt_chat.await_args_list
+            )
+        )
+        service._record_vsegpt_final_reply.assert_awaited_once()
+
+
+class ToolSelectionTests(unittest.TestCase):
+    def test_stable_or_subjective_questions_do_not_enable_search(self) -> None:
+        self.assertEqual(
+            ReplyService._tool_names_for_text("Лунный рыцарь это Marvel или DC?"),
+            (),
+        )
+        self.assertEqual(
+            ReplyService._tool_names_for_text("Что лучше: Star Wars или Marvel?"),
+            (),
+        )
+
+    def test_current_rating_and_reminder_enable_only_needed_tools(self) -> None:
+        self.assertEqual(
+            ReplyService._tool_names_for_text("Какая оценка сериала сейчас?"),
+            ("web_search",),
+        )
+        self.assertEqual(
+            ReplyService._tool_names_for_text("Напомни завтра позвонить"),
+            ("create_reminder",),
+        )
 
 
 class JournalAccessTests(unittest.IsolatedAsyncioTestCase):
