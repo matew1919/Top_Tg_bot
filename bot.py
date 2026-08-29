@@ -636,7 +636,15 @@ class ApiJournal:
         self._entry_count = 0
         if self.path.exists():
             try:
-                self._entry_count = len(self.path.read_text(encoding="utf-8").splitlines())
+                existing = self.path.read_text(encoding="utf-8").splitlines()
+                if len(existing) > self.max_entries:
+                    atomic_write_text(
+                        self.path,
+                        "\n".join(existing[-self.max_entries :]) + "\n",
+                        keep_backup=False,
+                    )
+                    existing = existing[-self.max_entries :]
+                self._entry_count = len(existing)
             except OSError:
                 LOGGER.warning("Could not inspect API journal %s", self.path)
         detail = "full content" if include_content else "metadata only"
@@ -717,8 +725,7 @@ class ApiJournal:
                 with self.path.open("a", encoding="utf-8") as journal_file:
                     journal_file.write(serialized + "\n")
                 self._entry_count += 1
-                rotation_slack = max(10, self.max_entries // 10)
-                if self._entry_count > self.max_entries + rotation_slack:
+                if self._entry_count > self.max_entries:
                     existing = self.path.read_text(encoding="utf-8").splitlines()
                     atomic_write_text(
                         self.path,

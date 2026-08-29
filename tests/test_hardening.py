@@ -68,6 +68,52 @@ class ApiJournalPrivacyTests(unittest.TestCase):
             self.assertEqual(entry["messages"]["roles"], ["user"])
             self.assertEqual(entry["response"]["character_count"], 14)
 
+    def test_journal_keeps_exactly_the_latest_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "api.jsonl"
+            journal = ApiJournal(
+                str(path),
+                max_entries=2,
+                enabled=True,
+                include_content=True,
+            )
+            for number in range(3):
+                journal.record(
+                    provider="test",
+                    model="model",
+                    messages=[{"role": "user", "content": str(number)}],
+                    response=f"answer-{number}",
+                    kind="reply",
+                    chat_id=42,
+                )
+
+            entries = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(entries), 2)
+            self.assertEqual(
+                [entry["response"] for entry in entries],
+                ["answer-1", "answer-2"],
+            )
+
+    def test_existing_journal_is_trimmed_when_opened(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "api.jsonl"
+            path.write_text(
+                "\n".join(json.dumps({"response": number}) for number in range(4))
+                + "\n",
+                encoding="utf-8",
+            )
+
+            ApiJournal(str(path), max_entries=2, enabled=True)
+
+            entries = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(entries, [{"response": 2}, {"response": 3}])
+
 
 class RateLimiterTests(unittest.TestCase):
     def test_limit_is_per_chat_and_user_and_expires(self) -> None:
