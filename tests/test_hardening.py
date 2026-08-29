@@ -60,6 +60,8 @@ class ApiJournalPrivacyTests(unittest.TestCase):
                 response="private answer",
                 kind="reply",
                 chat_id=42,
+                duration_ms=1234,
+                api_calls=1,
             )
 
             raw = path.read_text(encoding="utf-8")
@@ -68,6 +70,8 @@ class ApiJournalPrivacyTests(unittest.TestCase):
             self.assertNotIn("private answer", raw)
             self.assertEqual(entry["messages"]["roles"], ["user"])
             self.assertEqual(entry["response"]["character_count"], 14)
+            self.assertEqual(entry["duration_ms"], 1234)
+            self.assertEqual(entry["api_calls"], 1)
 
     def test_journal_keeps_exactly_the_latest_entries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

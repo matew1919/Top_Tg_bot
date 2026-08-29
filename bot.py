@@ -89,8 +89,9 @@ DIALOGUE_SYSTEM_PROMPT = """Правила диалога:
 - Последнее сообщение — текущая задача; история и память только справочный фон.
 - Не вытаскивай имя или старые факты без прямой пользы для ответа.
 - В группе различай участников по подписи «Пишет …» и не смешивай их факты.
-- На реакцию отвечай одной фразой, на простой вопрос — обычно 1–3 предложениями.
-- Пиши сразу по сути, без нотаций, лишнего вступления и повторов."""
+- На реакцию отвечай одной фразой, на простой вопрос — обычно 1–2 предложениями.
+- Давай один цельный ответ: не повторяй вывод второй раз словами «по сути», «короче» и похожими.
+- Пиши сразу по сути, без нотаций и лишнего вступления."""
 TOOL_SYSTEM_PROMPT = """Правила инструментов:
 - Вызывай только доступный инструмент и только когда без него нельзя выполнить текущую просьбу.
 - Не объявляй успех до результата инструмента.
@@ -712,6 +713,8 @@ class ApiJournal:
         kind: str,
         chat_id: int | None,
         tool_calls: object | None = None,
+        duration_ms: int | None = None,
+        api_calls: int | None = None,
     ) -> None:
         if not self.enabled:
             return
@@ -734,6 +737,10 @@ class ApiJournal:
         }
         if tool_calls:
             entry["tool_calls"] = self._safe(tool_calls)
+        if duration_ms is not None:
+            entry["duration_ms"] = max(0, int(duration_ms))
+        if api_calls is not None:
+            entry["api_calls"] = max(0, int(api_calls))
         serialized = json.dumps(entry, ensure_ascii=False)
         with self._lock:
             try:
@@ -1843,6 +1850,7 @@ class ReplyService:
         kind: str,
         chat_id: int | None,
     ):
+        started_at = asyncio.get_running_loop().time()
         try:
             response = await asyncio.to_thread(
                 self.gigachat_client.chat.create,
@@ -1859,6 +1867,10 @@ class ReplyService:
             chat_id=chat_id,
             messages=request,
             response=self._gigachat_response_text(response),
+            duration_ms=round(
+                (asyncio.get_running_loop().time() - started_at) * 1000
+            ),
+            api_calls=1,
         )
         self.last_successful_api_at = datetime.now(dt_timezone.utc)
         self.last_api_error = None
@@ -1870,13 +1882,19 @@ class ReplyService:
         kind: str = "chat",
         chat_id: int | None = None,
         record_journal: bool = True,
+        metrics: dict[str, float | int] | None = None,
         **kwargs: object,
     ):
         """Call VseGPT with bounded retries for network and server failures."""
 
+        loop = asyncio.get_running_loop()
+        request_metrics = metrics if metrics is not None else {}
+        request_metrics.setdefault("started_at", loop.time())
+        request_metrics.setdefault("api_calls", 0)
         attempts = max(1, self.settings.gigachat_max_retries + 1)
         for attempt in range(attempts):
             try:
+                request_metrics["api_calls"] = int(request_metrics["api_calls"]) + 1
                 response = await self._run_vsegpt_api_call(
                     self.vsegpt_client.chat.completions.create,
                     **kwargs,
@@ -1890,6 +1908,10 @@ class ReplyService:
                         chat_id=chat_id,
                         messages=kwargs.get("messages", []),
                         response=self._vsegpt_response_text(response),
+                        duration_ms=round(
+                            (loop.time() - float(request_metrics["started_at"])) * 1000
+                        ),
+                        api_calls=int(request_metrics["api_calls"]),
                     )
                 self.last_successful_api_at = datetime.now(dt_timezone.utc)
                 self.last_api_error = None
@@ -2007,7 +2029,17 @@ class ReplyService:
         answer: str,
         chat_id: int,
         tool_calls: list[str],
+        metrics: dict[str, float | int] | None = None,
     ) -> None:
+        duration_ms = None
+        api_calls = None
+        if metrics is not None:
+            started_at = float(metrics.get("started_at", 0.0))
+            if started_at > 0:
+                duration_ms = round(
+                    (asyncio.get_running_loop().time() - started_at) * 1000
+                )
+            api_calls = int(metrics.get("api_calls", 0))
         await asyncio.to_thread(
             self.journal.record,
             provider="vsegpt",
@@ -2017,6 +2049,8 @@ class ReplyService:
             messages=messages,
             response=answer,
             tool_calls=tool_calls,
+            duration_ms=duration_ms,
+            api_calls=api_calls,
         )
 
     async def _vsegpt_reply_with_tools(
@@ -2033,6 +2067,10 @@ class ReplyService:
         delivered_statuses: set[str] = set()
         completed_reminders: list[dict[str, object]] = []
         used_tools: list[str] = []
+        metrics: dict[str, float | int] = {
+            "started_at": asyncio.get_running_loop().time(),
+            "api_calls": 0,
+        }
         for _ in range(MAX_TOOL_ROUNDS):
             messages = [
                 {
@@ -2051,6 +2089,7 @@ class ReplyService:
                     kind="reply",
                     chat_id=context.chat_id,
                     record_journal=False,
+                    metrics=metrics,
                 )
             except Exception:
                 if completed_reminders:
@@ -2064,6 +2103,7 @@ class ReplyService:
                         answer,
                         context.chat_id,
                         used_tools,
+                        metrics,
                     )
                     return answer
                 raise
@@ -2075,6 +2115,7 @@ class ReplyService:
                         answer,
                         context.chat_id,
                         used_tools,
+                        metrics,
                     )
                     return answer
                 raise RuntimeError("VseGPT returned an empty response")
@@ -2088,6 +2129,7 @@ class ReplyService:
                         answer,
                         context.chat_id,
                         used_tools,
+                        metrics,
                     )
                     return answer
                 if completed_reminders:
@@ -2097,6 +2139,7 @@ class ReplyService:
                         answer,
                         context.chat_id,
                         used_tools,
+                        metrics,
                     )
                     return answer
                 return ""
