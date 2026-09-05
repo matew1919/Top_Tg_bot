@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Awaitable, Callable
@@ -16,6 +17,8 @@ from ddgs import DDGS
 
 
 ToolHandler = Callable[[dict[str, object], "ToolContext"], Awaitable[dict[str, object]]]
+SEARCH_TOTAL_TIMEOUT_SECONDS = 8.0
+SEARCH_BACKEND_TIMEOUT_SECONDS = 3.0
 
 
 @dataclass(frozen=True)
@@ -101,11 +104,19 @@ async def web_search(
     if not query:
         raise ValueError("query is required")
 
+    deadline = time.monotonic() + SEARCH_TOTAL_TIMEOUT_SECONDS
+
     def search() -> tuple[list[dict[str, str]], str]:
         failures: list[str] = []
-        for backend in ("brave", "duckduckgo", "google"):
+        for backend in ("duckduckgo", "brave", "google"):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
-                with DDGS(proxy=proxy, timeout=8) as search_client:
+                with DDGS(
+                    proxy=proxy,
+                    timeout=min(SEARCH_BACKEND_TIMEOUT_SECONDS, remaining),
+                ) as search_client:
                     raw_results = search_client.text(
                         query,
                         max_results=5,
@@ -132,7 +143,9 @@ async def web_search(
 
         raise RuntimeError("Search failed: " + "; ".join(failures))
 
-    results, backend = await asyncio.to_thread(search)
+    results, backend = await asyncio.wait_for(
+        asyncio.to_thread(search), timeout=SEARCH_TOTAL_TIMEOUT_SECONDS
+    )
     return {
         "ok": True,
         "query": query,
