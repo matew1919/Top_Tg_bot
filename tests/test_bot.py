@@ -20,6 +20,8 @@ from bot import (
     _process_incoming_messages,
     api_log_command,
     atomic_write_text,
+    contains_ignored_message,
+    error_handler,
     mentioned_bot,
     parse_reminder,
 )
@@ -156,25 +158,47 @@ class ToolFallbackTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ToolSelectionTests(unittest.TestCase):
-    def test_stable_or_subjective_questions_do_not_enable_search(self) -> None:
-        self.assertEqual(
-            ReplyService._tool_names_for_text("Лунный рыцарь это Marvel или DC?"),
-            (),
-        )
-        self.assertEqual(
-            ReplyService._tool_names_for_text("Что лучше: Star Wars или Marvel?"),
-            (),
-        )
+    def test_tools_are_available_without_magic_words(self) -> None:
+        for text in (
+            "Лунный рыцарь это Marvel или DC?",
+            "Что лучше: Star Wars или Marvel?",
+            "Какая оценка сериала сейчас?",
+            "Через час пни меня выпить воды",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    ReplyService._tool_names_for_text(text),
+                    ("web_search", "create_reminder"),
+                )
 
-    def test_current_rating_and_reminder_enable_only_needed_tools(self) -> None:
-        self.assertEqual(
-            ReplyService._tool_names_for_text("Какая оценка сериала сейчас?"),
-            ("web_search",),
+
+class SilentErrorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_telegram_errors_are_logged_without_outbound_calls(self) -> None:
+        bot = SimpleNamespace(send_message=AsyncMock())
+        service = object.__new__(ReplyService)
+        service.settings = SimpleNamespace(bot_owner_ids={1152363667})
+        context = SimpleNamespace(
+            error=RuntimeError("network unavailable"),
+            application=SimpleNamespace(bot=bot, bot_data={"reply_service": service}),
         )
-        self.assertEqual(
-            ReplyService._tool_names_for_text("Напомни завтра позвонить"),
-            ("create_reminder",),
-        )
+        with patch("bot.LOGGER.error") as log:
+            await error_handler(None, context)
+        log.assert_called_once()
+        bot.send_message.assert_not_awaited()
+
+
+class IgnoredMessageTests(unittest.TestCase):
+    def test_only_selected_words_and_laughter_prefix_are_filtered(self) -> None:
+        for text in ("ахахаха", "АХАХАХАХ!!!", "ну норм", "?? кайф", "ахахах", "кайф!", "?? это норм", "ну\nкайф"):
+            with self.subTest(text=text):
+                self.assertTrue(contains_ignored_message(text))
+        for text in (
+            "спасибо", "ок", "круто", "нормально", "кайфовый", "норматив", "",
+            "это норм, спасибо", "норм, расскажи подробнее", "ахахахахнуда",
+            "?? кайф расскажи подробнее", "кайф\nрасскажи\nподробнее",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(contains_ignored_message(text))
 
 
 class JournalAccessTests(unittest.IsolatedAsyncioTestCase):
@@ -335,6 +359,41 @@ class MultimodalReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call.args[4], "general")
         self.assertEqual(call.kwargs["images"][0].label, "фото")
         self.assertIn("?? что на фото?", call.args[3])
+
+    async def test_ignored_phrases_override_reply_mention_and_media_triggers(self) -> None:
+        replied = self._message(from_user=SimpleNamespace(id=99, is_bot=True))
+        for text in ("ахахаха", "норм", "кайф", "@Peter ?? это норм", "да кайф"):
+            with self.subTest(text=text):
+                message = self._message(text=text, reply_to_message=replied)
+                service, processor = await self._run(message)
+                service.reply.assert_not_awaited()
+                processor.prepare_telegram_message.assert_not_awaited()
+                message.reply_text.assert_not_awaited()
+        message = self._message(
+            photo=[SimpleNamespace(file_id="photo", file_size=100)],
+            caption="@Peter кайф",
+            chat=SimpleNamespace(id=100, type="private"),
+        )
+        service, processor = await self._run(message)
+        service.reply.assert_not_awaited()
+        processor.prepare_telegram_message.assert_not_awaited()
+
+    async def test_reaction_with_continuation_is_answered(self) -> None:
+        replied = self._message(
+            from_user=SimpleNamespace(id=99, is_bot=True, full_name="Peter", username="Peter"),
+        )
+        message = self._message(text="норм, расскажи подробнее", reply_to_message=replied)
+        service, _ = await self._run(message)
+        service.reply.assert_awaited_once()
+
+    async def test_ignored_word_in_quoted_message_does_not_suppress_question(self) -> None:
+        replied = self._message(
+            text="кайф",
+            from_user=SimpleNamespace(id=99, is_bot=True, full_name="Peter", username="Peter"),
+        )
+        message = self._message(text="?? что ты имеешь в виду?", reply_to_message=replied)
+        service, _ = await self._run(message)
+        service.reply.assert_awaited_once()
 
     async def test_plain_group_photo_is_ignored(self) -> None:
         photo = SimpleNamespace(file_id="photo", file_size=100)

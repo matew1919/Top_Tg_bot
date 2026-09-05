@@ -76,7 +76,7 @@ class VacancyMonitorTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(monitor.store.is_seen(item.key))
             self.assertIn("telegram unavailable", monitor.last_error or "")
 
-    async def test_source_alert_is_throttled_and_recovery_is_reported(self) -> None:
+    async def test_source_failure_and_recovery_are_recorded_without_telegram_alerts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             monitor_settings = settings()
             monitor_settings = VacancyMonitorSettings(
@@ -99,15 +99,15 @@ class VacancyMonitorTests(unittest.IsolatedAsyncioTestCase):
             for _ in range(3):
                 await monitor.check(sender)
 
-            self.assertEqual(sender.await_count, 1)
-            self.assertIn("3 проверки подряд", sender.await_args.args[1])
+            sender.assert_not_awaited()
+            self.assertEqual(monitor.store.health["sources"]["habr"]["consecutive_failures"], 3)
 
             monitor.parser.last_source_errors = {}
             monitor.parser.last_source_counts = {"hh": 1, "habr": 1}
             await monitor.check(sender)
 
-            self.assertEqual(sender.await_count, 2)
-            self.assertIn("снова работает", sender.await_args.args[1])
+            sender.assert_not_awaited()
+            self.assertEqual(monitor.store.health["sources"]["habr"]["consecutive_failures"], 0)
 
     async def test_health_survives_monitor_restart(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

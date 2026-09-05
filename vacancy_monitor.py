@@ -204,7 +204,7 @@ class VacancyMonitor:
             ) + 1
         self.store.update_health(health)
 
-    async def _deliver_health_notices(self, sender: SendMessage) -> None:
+    def _log_health_changes(self) -> None:
         health = dict(self.store.health)
         sources_value = health.get("sources", {})
         sources = dict(sources_value) if isinstance(sources_value, dict) else {}
@@ -244,7 +244,7 @@ class VacancyMonitor:
             health["monitor_alert_active"] = False
             changed = True
         if changed:
-            await sender(self.settings.target_chat_id, "\n".join(messages))
+            LOGGER.info("Vacancy health: %s", " | ".join(messages))
             health["sources"] = sources
             self.store.update_health(health)
 
@@ -288,7 +288,6 @@ class VacancyMonitor:
                 self.last_total = len(vacancies)
                 self.last_matches = len(matches)
                 self.last_new = sent
-                source_errors = self.parser.last_source_errors
                 should_report = (
                     force_status
                     or self.settings.send_status_every_check
@@ -300,20 +299,15 @@ class VacancyMonitor:
                         result = f"Отправлено новых вакансий: {sent}."
                     else:
                         result = "Новых вакансий не найдено."
-                    source_note = ""
-                    if source_errors:
-                        source_note = "\nОшибки источников: " + ", ".join(
-                            sorted(source_errors)
-                        )
                     await sender(
                         self.settings.target_chat_id,
-                        f"{result}\nПроверено: {len(vacancies)}. Подходит: {len(matches)}.{source_note}",
+                        f"{result}\nПроверено: {len(vacancies)}. Подходит: {len(matches)}.",
                     )
                 self._record_check_result(success=True)
                 try:
-                    await self._deliver_health_notices(sender)
+                    self._log_health_changes()
                 except Exception:
-                    LOGGER.exception("Could not deliver vacancy health notification")
+                    LOGGER.exception("Could not record vacancy health change")
                 return len(vacancies), len(matches), sent
             except Exception as error:
                 self.last_error = (str(error) or type(error).__name__)[:300]
@@ -321,9 +315,9 @@ class VacancyMonitor:
                     self._update_source_health()
                 self._record_check_result(success=False)
                 try:
-                    await self._deliver_health_notices(sender)
+                    self._log_health_changes()
                 except Exception:
-                    LOGGER.exception("Could not deliver vacancy health notification")
+                    LOGGER.exception("Could not record vacancy health change")
                 raise
 
     async def run(self, sender: SendMessage) -> None:
