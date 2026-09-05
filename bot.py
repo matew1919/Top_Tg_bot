@@ -87,7 +87,7 @@ TELEGRAM_TYPING_REQUEST_TIMEOUT_SECONDS = 3.0
 TelegramResult = TypeVar("TelegramResult")
 # Only these user-selected reactions suppress short incoming messages.
 IGNORED_MESSAGE_PATTERNS = (
-    re.compile(r"\bахах(?:ах)*а?\b"),
+    re.compile(r"\b[ах]*аха[ах]*\b"),
     re.compile(r"\bнорм\b"),
     re.compile(r"\bкайф\b"),
 )
