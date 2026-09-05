@@ -87,9 +87,9 @@ TELEGRAM_TYPING_REQUEST_TIMEOUT_SECONDS = 3.0
 TelegramResult = TypeVar("TelegramResult")
 # Only these user-selected reactions suppress short incoming messages.
 IGNORED_MESSAGE_PATTERNS = (
-    re.compile(r"\bахах(?:ах)*а?\b", re.IGNORECASE),
-    re.compile(r"\bнорм\b", re.IGNORECASE),
-    re.compile(r"\bкайф\b", re.IGNORECASE),
+    re.compile(r"\bахах(?:ах)*а?\b"),
+    re.compile(r"\bнорм\b"),
+    re.compile(r"\bкайф\b"),
 )
 DIALOGUE_SYSTEM_PROMPT = """Правила диалога:
 - Последнее сообщение — текущая задача; история и память только справочный фон.
@@ -488,7 +488,7 @@ def contains_ignored_message(text: str) -> bool:
     """Ignore selected reactions only when there are fewer than two word gaps."""
 
     text = re.sub(r"^(?:\s*\?\?)+\s*", "", text)
-    normalized = " ".join(text.split())
+    normalized = " ".join(text.lower().split())
     return normalized.count(" ") < 2 and any(
         pattern.search(normalized) for pattern in IGNORED_MESSAGE_PATTERNS
     )
