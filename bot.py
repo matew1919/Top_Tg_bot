@@ -4109,6 +4109,9 @@ async def _process_incoming_messages(
     if not chat or (message.from_user and message.from_user.is_bot):
         return
 
+    if any(message_body(item).rstrip().endswith("/") for item in messages):
+        return
+
     if any(
         contains_ignored_message(
             cleaned_message_body(item, context.bot.username, context.bot.id)
