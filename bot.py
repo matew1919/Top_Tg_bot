@@ -86,6 +86,7 @@ TELEGRAM_TYPING_INTERVAL_SECONDS = 4.0
 TELEGRAM_TYPING_REQUEST_TIMEOUT_SECONDS = 3.0
 TOOL_STATUS_TIMEOUT_SECONDS = 3.0
 TOOL_STATUS_DELETE_TIMEOUT_SECONDS = 2.0
+TELEGRAM_KEEPALIVE_SECONDS = 30.0
 TelegramResult = TypeVar("TelegramResult")
 # Only these user-selected reactions suppress short incoming messages.
 IGNORED_MESSAGE_PATTERNS = (
@@ -3535,7 +3536,34 @@ async def supervise_background_task(
             await asyncio.sleep(min(300, 10 * crashes))
 
 
+async def telegram_keepalive_loop(application: Application) -> None:
+    """Keep the outbound connection usable across quiet periods without sending messages."""
+    unavailable = False
+    while True:
+        delay = TELEGRAM_KEEPALIVE_SECONDS
+        try:
+            await asyncio.wait_for(
+                application.bot.get_me(
+                    connect_timeout=4, read_timeout=5, write_timeout=5, pool_timeout=2,
+                ),
+                timeout=8,
+            )
+            if unavailable:
+                LOGGER.info("Telegram outbound connection recovered")
+            unavailable = False
+        except (NetworkError, asyncio.TimeoutError) as error:
+            if not unavailable:
+                LOGGER.warning("Telegram connection check failed: %s", type(error).__name__)
+            unavailable = True
+            delay = 5.0
+        await asyncio.sleep(delay)
+
+
 async def start_background_tasks(application: Application) -> None:
+    application.bot_data["telegram_keepalive_task"] = asyncio.create_task(
+        supervise_background_task(application, "telegram-keepalive", telegram_keepalive_loop),
+        name="telegram-keepalive-supervisor",
+    )
     application.bot_data["reminder_task"] = asyncio.create_task(
         supervise_background_task(application, "reminder-loop", reminder_loop),
         name="reminder-supervisor",
@@ -3557,7 +3585,7 @@ async def start_background_tasks(application: Application) -> None:
 
 
 async def stop_background_tasks(application: Application) -> None:
-    for task_name in ("reminder_task", "vacancy_task"):
+    for task_name in ("telegram_keepalive_task", "reminder_task", "vacancy_task"):
         task = application.bot_data.get(task_name)
         if not isinstance(task, asyncio.Task):
             continue
@@ -4379,10 +4407,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def build_application(settings: Settings) -> Application:
     request_options: dict[str, object] = {
-        "connect_timeout": min(8.0, settings.telegram_timeout),
-        "read_timeout": settings.telegram_timeout,
-        "write_timeout": settings.telegram_timeout,
-        "pool_timeout": min(3.0, settings.telegram_timeout),
+        "connect_timeout": min(4.0, settings.telegram_timeout),
+        "read_timeout": min(10.0, settings.telegram_timeout),
+        "write_timeout": min(10.0, settings.telegram_timeout),
+        "pool_timeout": min(2.0, settings.telegram_timeout),
     }
     get_updates_options = {
         **request_options,
@@ -4403,6 +4431,13 @@ def build_application(settings: Settings) -> Application:
         .request(
             HTTPXRequest(
                 connection_pool_size=TELEGRAM_REQUEST_POOL_SIZE,
+                httpx_kwargs={
+                    "limits": httpx.Limits(
+                        max_connections=TELEGRAM_REQUEST_POOL_SIZE,
+                        max_keepalive_connections=TELEGRAM_REQUEST_POOL_SIZE,
+                        keepalive_expiry=TELEGRAM_KEEPALIVE_SECONDS * 2 + 5,
+                    ),
+                },
                 **request_options,
             )
         )

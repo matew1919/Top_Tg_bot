@@ -4,11 +4,32 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from bot import ReplyService
+from telegram.error import NetworkError
+
+from bot import ReplyService, telegram_keepalive_loop, stop_background_tasks
 from tools_registry import ToolContext, web_search
 
 
 class ResponseLatencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_keepalive_reconnects_after_network_failure_without_sending(self):
+        bot = SimpleNamespace(
+            get_me=AsyncMock(side_effect=[NetworkError("offline"), object()]),
+            send_message=AsyncMock(),
+        )
+        application = SimpleNamespace(bot=bot)
+        with patch("bot.asyncio.sleep", new=AsyncMock(side_effect=[None, asyncio.CancelledError])) as sleep:
+            with self.assertRaises(asyncio.CancelledError):
+                await telegram_keepalive_loop(application)
+        self.assertEqual(bot.get_me.await_count, 2)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [5.0, 30.0])
+        bot.send_message.assert_not_awaited()
+
+    async def test_shutdown_cancels_connection_keepalive(self):
+        task = asyncio.create_task(asyncio.Event().wait())
+        application = SimpleNamespace(bot_data={"telegram_keepalive_task": task})
+        await stop_background_tasks(application)
+        self.assertTrue(task.cancelled())
+
     async def test_stalled_progress_message_does_not_block_tool_or_answer(self):
         service = object.__new__(ReplyService)
         service.settings = SimpleNamespace(vsegpt_model="test", vsegpt_max_tokens=200)
