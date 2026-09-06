@@ -189,13 +189,14 @@ class SilentErrorTests(unittest.IsolatedAsyncioTestCase):
 
 class IgnoredMessageTests(unittest.TestCase):
     def test_only_selected_words_and_laughter_prefix_are_filtered(self) -> None:
-        for text in ("ахахаха", "АХАХАХАХ!!!", "ну норм", "?? кайф", "ахахах", "кайф!", "?? это норм", "ну\nкайф"):
+        for text in ("ахахаха", "АХАХАХАХ!!!", "ну норм", "?? кайф", "ахахах", "кайф!", "?? это норм", "ну\nкайф", "Нифига", "НИФИГА!"):
             with self.subTest(text=text):
                 self.assertTrue(contains_ignored_message(text))
         for text in (
             "спасибо", "ок", "круто", "нормально", "кайфовый", "норматив", "",
             "это норм, спасибо", "норм, расскажи подробнее", "ахахахахнуда",
             "?? кайф расскажи подробнее", "кайф\nрасскажи\nподробнее",
+            "Нифига, расскажи подробнее",
         ):
             with self.subTest(text=text):
                 self.assertFalse(contains_ignored_message(text))
@@ -362,7 +363,7 @@ class MultimodalReplyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ignored_phrases_override_reply_mention_and_media_triggers(self) -> None:
         replied = self._message(from_user=SimpleNamespace(id=99, is_bot=True))
-        for text in ("ахахаха", "норм", "кайф", "@Peter ?? это норм", "да кайф"):
+        for text in ("ахахаха", "норм", "кайф", "@Peter ?? это норм", "да кайф", "Нифига"):
             with self.subTest(text=text):
                 message = self._message(text=text, reply_to_message=replied)
                 service, processor = await self._run(message)

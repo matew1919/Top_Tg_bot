@@ -1,16 +1,37 @@
 import asyncio
 import threading
 import unittest
+import httpx
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from telegram.error import NetworkError
+from telegram.error import NetworkError, RetryAfter
 
-from bot import ReplyService, telegram_keepalive_loop, stop_background_tasks
+from bot import ReplyService, telegram_keepalive_loop, stop_background_tasks, reply_text_with_retry
 from tools_registry import ToolContext, web_search
 
 
 class ResponseLatencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uncertain_send_is_not_repeated(self):
+        for cause in (httpx.ReadTimeout("lost response"), httpx.WriteError("partial write"),
+                      httpx.RemoteProtocolError("disconnected"), None):
+            with self.subTest(cause=type(cause).__name__):
+                error = NetworkError("unconfirmed")
+                error.__cause__ = cause
+                message = SimpleNamespace(reply_text=AsyncMock(side_effect=error))
+                with self.assertRaises(NetworkError):
+                    await reply_text_with_retry(message, "answer")
+                message.reply_text.assert_awaited_once()
+
+    async def test_connect_failure_and_rate_limit_can_be_retried(self):
+        connection_error = NetworkError("not connected")
+        connection_error.__cause__ = httpx.ConnectTimeout("connect timed out")
+        for error in (connection_error, RetryAfter(1)):
+            message = SimpleNamespace(reply_text=AsyncMock(side_effect=[error, "sent"]))
+            with patch("bot.asyncio.sleep", new=AsyncMock()):
+                self.assertEqual(await reply_text_with_retry(message, "answer"), "sent")
+            self.assertEqual(message.reply_text.await_count, 2)
+
     async def test_keepalive_reconnects_after_network_failure_without_sending(self):
         bot = SimpleNamespace(
             get_me=AsyncMock(side_effect=[NetworkError("offline"), object()]),

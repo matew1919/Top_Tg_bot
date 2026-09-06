@@ -85,7 +85,6 @@ TELEGRAM_TYPING_DELAY_SECONDS = 0.75
 TELEGRAM_TYPING_INTERVAL_SECONDS = 4.0
 TELEGRAM_TYPING_REQUEST_TIMEOUT_SECONDS = 3.0
 TOOL_STATUS_TIMEOUT_SECONDS = 3.0
-TOOL_STATUS_DELETE_TIMEOUT_SECONDS = 2.0
 TELEGRAM_KEEPALIVE_SECONDS = 30.0
 TelegramResult = TypeVar("TelegramResult")
 # Only these user-selected reactions suppress short incoming messages.
@@ -93,6 +92,7 @@ IGNORED_MESSAGE_PATTERNS = (
     re.compile(r"\b[ах]*аха[ах]*\b"),
     re.compile(r"\bнорм\b"),
     re.compile(r"\bкайф\b"),
+    re.compile(r"\bнифига\b"),
 )
 DIALOGUE_SYSTEM_PROMPT = """Правила диалога:
 - Последнее сообщение — текущая задача; история и память только справочный фон.
@@ -600,7 +600,7 @@ async def telegram_request_with_retry(
     request_factory: Callable[[], Awaitable[TelegramResult]],
     operation_name: str,
 ) -> TelegramResult:
-    """Retry outbound Telegram calls that fail from network or pool pressure."""
+    """Retry rejected/unsubmitted sends, never sends with unknown delivery status."""
 
     for attempt in range(1, TELEGRAM_SEND_ATTEMPTS + 1):
         last_error: Exception | None = None
@@ -613,6 +613,12 @@ async def telegram_request_with_retry(
             delay = _retry_after_seconds(error) + 0.1
         except NetworkError as error:
             if isinstance(error, BadRequest) or attempt >= TELEGRAM_SEND_ATTEMPTS:
+                raise
+            if not telegram_send_definitely_not_submitted(error):
+                LOGGER.warning(
+                    "Telegram %s delivery is unconfirmed; not resending to avoid duplicates",
+                    operation_name,
+                )
                 raise
             last_error = error
             delay = min(4.0, 0.5 * (2 ** (attempt - 1)))
@@ -627,6 +633,20 @@ async def telegram_request_with_retry(
         await asyncio.sleep(delay)
 
     raise RuntimeError("Telegram retry loop ended unexpectedly")
+
+
+def telegram_send_definitely_not_submitted(error: BaseException) -> bool:
+    """PTB preserves the HTTPX cause: only connect/pool failures precede sending."""
+    seen: set[int] = set()
+    cause: BaseException | None = error
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if isinstance(cause, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+            return True
+        if isinstance(cause, httpx.HTTPError):
+            return False
+        cause = cause.__cause__
+    return False
 
 
 async def reply_text_with_retry(message: Message, text: str) -> Message:
@@ -4275,52 +4295,31 @@ async def _process_incoming_messages(
         or media_trigger
         else "english_coach"
     )
-    tool_status_messages: list[Message] = []
-
-    async def send_tool_status(status_text: str) -> None:
-        # Progress is best-effort: retries must not delay the actual tool.
-        status_message = await message.reply_text(status_text)
-        tool_status_messages.append(status_message)
-
-    try:
-        answer = await run_with_typing(
-            bot,
-            chat.id,
-            run_limited(
-                context.application.bot_data.get("request_semaphore"),
-                service.reply(
-                    chat.id,
-                    user_id,
-                    user_name,
-                    user_text,
-                    mode,
-                    chat.type,
-                    tool_status_callback=send_tool_status,
-                    images=prepared.images,
-                    allow_tools=prepared.allow_tools,
-                ),
+    # Typing covers both generation and tools without creating orphan status messages.
+    answer = await run_with_typing(
+        bot,
+        chat.id,
+        run_limited(
+            context.application.bot_data.get("request_semaphore"),
+            service.reply(
+                chat.id,
+                user_id,
+                user_name,
+                user_text,
+                mode,
+                chat.type,
+                images=prepared.images,
+                allow_tools=prepared.allow_tools,
             ),
-        )
-        delivery_started_at = asyncio.get_running_loop().time()
-        await reply_text_with_retry(message, answer)
-        LOGGER.info(
-            "Reply delivery completed: chat=%s duration_ms=%s",
-            chat.id,
-            round((asyncio.get_running_loop().time() - delivery_started_at) * 1000),
-        )
-    finally:
-        for status_message in tool_status_messages:
-            try:
-                await asyncio.wait_for(
-                    status_message.delete(),
-                    timeout=TOOL_STATUS_DELETE_TIMEOUT_SECONDS,
-                )
-            except Exception:
-                LOGGER.warning(
-                    "Could not delete tool status message %s",
-                    status_message.message_id,
-                    exc_info=True,
-                )
+        ),
+    )
+    delivery_started_at = asyncio.get_running_loop().time()
+    await reply_text_with_retry(message, answer)
+    LOGGER.info(
+        "Reply delivery completed: chat=%s duration_ms=%s",
+        chat.id,
+        round((asyncio.get_running_loop().time() - delivery_started_at) * 1000),
+    )
 
 
 async def _flush_media_group(
