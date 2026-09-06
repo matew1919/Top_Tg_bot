@@ -27,6 +27,7 @@ from bot import (
 )
 from media_processing import extract_supported_video_urls, is_supported_video_url
 from tools_registry import ToolContext
+from search_status import StatusMessages
 
 
 class ReminderParsingTests(unittest.TestCase):
@@ -316,11 +317,11 @@ class MultimodalReplyTests(unittest.IsolatedAsyncioTestCase):
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
 
-    async def _run(self, message, prepare_side_effect=None):
+    async def _run(self, message, prepare_side_effect=None, reply_side_effect=None, status_manager=None):
         settings = SimpleNamespace(
             media_max_transcript_chars=12000,
         )
-        service = SimpleNamespace(settings=settings, reply=AsyncMock(return_value="готово"))
+        service = SimpleNamespace(settings=settings, reply=AsyncMock(return_value="готово", side_effect=reply_side_effect))
 
         async def prepare_message(*args, **kwargs):
             prepared = kwargs["prepared"]
@@ -336,6 +337,8 @@ class MultimodalReplyTests(unittest.IsolatedAsyncioTestCase):
         application = SimpleNamespace(
             bot_data={"reply_service": service, "media_processor": processor}
         )
+        if status_manager is not None:
+            application.bot_data["tool_status_manager"] = status_manager
         context = SimpleNamespace(application=application, bot=bot)
 
         async def passthrough(_bot, _chat_id, operation):
@@ -344,6 +347,33 @@ class MultimodalReplyTests(unittest.IsolatedAsyncioTestCase):
         with patch("bot.run_with_typing", side_effect=passthrough):
             await _process_incoming_messages([message], context)
         return service, processor
+
+    async def test_search_status_is_deleted_before_success_or_error_answer(self):
+        for answer in ("Нашёл ответ", "Поиск не сработал"):
+            with self.subTest(answer=answer), tempfile.TemporaryDirectory() as directory:
+                events = []
+                message = self._message(text="?? что нового?")
+
+                async def send(text):
+                    events.append(text)
+                    return SimpleNamespace(chat=message.chat, message_id=123)
+
+                async def delete(**kwargs):
+                    events.append("delete")
+
+                async def reply(*args, **kwargs):
+                    await kwargs["tool_status_callback"]("Ща гляну")
+                    events.append("search")
+                    return answer
+
+                message.reply_text.side_effect = send
+                manager = StatusMessages(
+                    SimpleNamespace(delete_message=AsyncMock(side_effect=delete)),
+                    Path(directory) / "status.json",
+                )
+                await self._run(message, reply_side_effect=reply, status_manager=manager)
+                self.assertEqual(events, ["Ща гляну", "search", "delete", answer])
+                self.assertFalse(manager.pending)
 
     async def test_group_photo_uses_question_trigger_without_analysis_command(self) -> None:
         photo = SimpleNamespace(file_id="photo", file_size=100)
