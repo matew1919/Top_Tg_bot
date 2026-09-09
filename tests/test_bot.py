@@ -24,6 +24,7 @@ from bot import (
     error_handler,
     mentioned_bot,
     parse_reminder,
+    strip_tool_status_prefix,
 )
 from media_processing import extract_supported_video_urls, is_supported_video_url
 from tools_registry import ToolContext
@@ -201,6 +202,19 @@ class IgnoredMessageTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertFalse(contains_ignored_message(text))
+
+
+class ToolStatusTextTests(unittest.TestCase):
+    def test_progress_prefix_is_removed_from_final_answer(self):
+        self.assertEqual(
+            strip_tool_status_prefix("Да ща проверю, что там. Нашёл: всё работает."),
+            "Нашёл: всё работает.",
+        )
+        self.assertEqual(
+            strip_tool_status_prefix("Ща гляну, что там сейчас по моделям…\nМой ответ."),
+            "Мой ответ.",
+        )
+        self.assertEqual(strip_tool_status_prefix("Ща гляну"), "Ща гляну")
 
 
 class JournalAccessTests(unittest.IsolatedAsyncioTestCase):

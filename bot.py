@@ -110,6 +110,17 @@ TOOL_SYSTEM_PROMPT = """Правила инструментов:
 - Не объявляй успех до результата инструмента.
 - При сбое поиска честно скажи, что проверить не удалось; не представляй догадки как найденные факты.
 - После результата ответь естественно, без служебного JSON и внутренних рассуждений."""
+TOOL_STATUS_PREFIX_RE = re.compile(
+    r"^\s*(?:да\s+)?(?:ща|сейчас|секунду)\s+(?:я\s+)?"
+    r"(?:гляну|проверю|посмотрю|поищу)[^.!?\n]*(?:[.!?…]+\s*|\n+)",
+    re.IGNORECASE,
+)
+
+
+def strip_tool_status_prefix(text: str) -> str:
+    """Keep a progress status separate from the final model answer."""
+
+    return TOOL_STATUS_PREFIX_RE.sub("", text.strip(), count=1).strip()
 
 
 def load_runtime_config() -> dict[str, object]:
@@ -2137,7 +2148,7 @@ class ReplyService:
             message = response.choices[0].message
             tool_calls = list(message.tool_calls or [])
             if not tool_calls:
-                answer = (message.content or "").strip()
+                answer = strip_tool_status_prefix(message.content or "")
                 if answer:
                     await self._record_vsegpt_final_reply(
                         request_messages,
