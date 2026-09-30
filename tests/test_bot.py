@@ -15,6 +15,7 @@ from bot import (
     MediaProcessor,
     PreparedMedia,
     REMINDER_MAX_DELIVERY_ATTEMPTS,
+    RecentMessageIds,
     ReminderStore,
     ReplyService,
     _process_incoming_messages,
@@ -172,6 +173,17 @@ class ToolSelectionTests(unittest.TestCase):
                     ReplyService._tool_names_for_text(text),
                     ("web_search", "create_reminder"),
                 )
+
+
+class RecentMessageIdsTests(unittest.TestCase):
+    def test_repeated_message_id_is_rejected(self) -> None:
+        recent = RecentMessageIds(max_entries=2)
+
+        self.assertTrue(recent.accept(-100, 10))
+        self.assertFalse(recent.accept(-100, 10))
+        self.assertTrue(recent.accept(-100, 11))
+        self.assertTrue(recent.accept(-100, 12))
+        self.assertTrue(recent.accept(-100, 10))
 
 
 class SilentErrorTests(unittest.IsolatedAsyncioTestCase):
