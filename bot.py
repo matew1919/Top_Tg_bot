@@ -503,6 +503,26 @@ def question_trigger(text: str) -> bool:
     return text.lstrip().startswith("??")
 
 
+SHORT_REPLY_QUESTION_WORDS = frozenset(
+    {
+        "что", "че", "чё", "где", "когда", "как", "почему", "зачем",
+        "кто", "кого", "кому", "куда", "откуда", "какой", "какая",
+        "какое", "какие", "сколько", "чей", "чья", "чье", "чьё",
+        "можно", "нужно", "стоит",
+    }
+)
+
+
+def ignore_short_untagged_reply(text: str) -> bool:
+    """Ignore tiny replies to the bot unless they contain a question word."""
+
+    normalized = " ".join(text.lower().split())
+    if not normalized or normalized.count(" ") >= 2:
+        return False
+    words = set(re.findall(r"[0-9a-zа-яё]+", normalized))
+    return words.isdisjoint(SHORT_REPLY_QUESTION_WORDS)
+
+
 def contains_ignored_message(text: str) -> bool:
     """Ignore selected reactions only when there are fewer than two word gaps."""
 
@@ -4248,6 +4268,16 @@ async def _process_incoming_messages(
         )
     )
     explicit_group_call = is_mentioned or is_reply_to_bot or is_question_trigger
+
+    if (
+        not is_private_chat
+        and is_reply_to_bot
+        and not is_mentioned
+        and not is_question_trigger
+    ):
+        reply_body = " ".join(body for body in bodies if body).strip()
+        if reply_body and ignore_short_untagged_reply(reply_body):
+            return
 
     if (
         not is_private_chat

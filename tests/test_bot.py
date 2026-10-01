@@ -23,6 +23,7 @@ from bot import (
     atomic_write_text,
     contains_ignored_message,
     error_handler,
+    ignore_short_untagged_reply,
     mentioned_bot,
     parse_reminder,
     strip_tool_status_prefix,
@@ -214,6 +215,14 @@ class IgnoredMessageTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertFalse(contains_ignored_message(text))
+
+    def test_short_untagged_reply_filter_keeps_questions(self) -> None:
+        for text in ("согласен", "да точно", "ну да"):
+            with self.subTest(text=text):
+                self.assertTrue(ignore_short_untagged_reply(text))
+        for text in ("что", "как так", "а почему", "ну я согласен"):
+            with self.subTest(text=text):
+                self.assertFalse(ignore_short_untagged_reply(text))
 
 
 class ToolStatusTextTests(unittest.TestCase):
@@ -442,6 +451,22 @@ class MultimodalReplyTests(unittest.IsolatedAsyncioTestCase):
         message = self._message(text="норм, расскажи подробнее", reply_to_message=replied)
         service, _ = await self._run(message)
         service.reply.assert_awaited_once()
+
+    async def test_short_reply_to_bot_requires_tag_or_question(self) -> None:
+        replied = self._message(
+            from_user=SimpleNamespace(id=99, is_bot=True, full_name="Peter", username="Peter"),
+        )
+        for text in ("согласен", "да точно"):
+            with self.subTest(text=text):
+                message = self._message(text=text, reply_to_message=replied)
+                service, _ = await self._run(message)
+                service.reply.assert_not_awaited()
+
+        for text in ("как так", "?? согласен", "@Peter согласен"):
+            with self.subTest(text=text):
+                message = self._message(text=text, reply_to_message=replied)
+                service, _ = await self._run(message)
+                service.reply.assert_awaited_once()
 
     async def test_ignored_word_in_quoted_message_does_not_suppress_question(self) -> None:
         replied = self._message(
