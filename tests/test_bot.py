@@ -15,6 +15,7 @@ from bot import (
     MediaProcessor,
     PreparedMedia,
     REMINDER_MAX_DELIVERY_ATTEMPTS,
+    RecentMessageFingerprints,
     RecentMessageIds,
     ReminderStore,
     ReplyService,
@@ -185,6 +186,15 @@ class RecentMessageIdsTests(unittest.TestCase):
         self.assertTrue(recent.accept(-100, 11))
         self.assertTrue(recent.accept(-100, 12))
         self.assertTrue(recent.accept(-100, 10))
+
+    def test_same_text_with_new_id_is_debounced_briefly(self) -> None:
+        recent = RecentMessageFingerprints(window_seconds=45)
+
+        self.assertTrue(recent.accept(-100, 7, 0, "??\nВопрос", now=100))
+        self.assertFalse(recent.accept(-100, 7, 0, "  ?? вопрос  ", now=119))
+        self.assertTrue(recent.accept(-100, 7, 0, "?? вопрос", now=146))
+        self.assertTrue(recent.accept(-100, 8, 0, "?? вопрос", now=120))
+        self.assertTrue(recent.accept(-100, 7, 55, "?? вопрос", now=120))
 
 
 class SilentErrorTests(unittest.IsolatedAsyncioTestCase):

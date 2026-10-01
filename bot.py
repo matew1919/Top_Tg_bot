@@ -25,6 +25,7 @@ import json
 import socket
 import tempfile
 import threading
+import time
 from collections import defaultdict, deque
 from base64 import b64encode
 from dataclasses import dataclass, field
@@ -590,6 +591,41 @@ class RecentMessageIds:
         self._order.append(key)
         while len(self._order) > self.max_entries:
             self._seen.discard(self._order.popleft())
+        return True
+
+
+class RecentMessageFingerprints:
+    """Debounce duplicate text that Telegram delivers under a different ID."""
+
+    def __init__(self, window_seconds: float = 45.0, max_entries: int = 1024) -> None:
+        self.window_seconds = max(1.0, window_seconds)
+        self.max_entries = max(1, max_entries)
+        self._seen: dict[tuple[int, int, int, str], float] = {}
+
+    def accept(
+        self,
+        chat_id: int,
+        user_id: int,
+        reply_to_message_id: int,
+        text: str,
+        now: float | None = None,
+    ) -> bool:
+        normalized = " ".join(text.lower().split())
+        if not normalized:
+            return True
+        current = time.monotonic() if now is None else now
+        cutoff = current - self.window_seconds
+        self._seen = {
+            key: seen_at for key, seen_at in self._seen.items() if seen_at > cutoff
+        }
+        if len(self._seen) >= self.max_entries:
+            oldest = min(self._seen, key=self._seen.get)
+            self._seen.pop(oldest, None)
+        key = (chat_id, user_id, reply_to_message_id, normalized)
+        previous = self._seen.get(key)
+        if previous is not None and previous > cutoff:
+            return False
+        self._seen[key] = current
         return True
 
 
@@ -4463,6 +4499,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             message.message_id,
         )
         return
+    recent_fingerprints = context.application.bot_data.get("recent_message_fingerprints")
+    sender_id = message.from_user.id if message.from_user else 0
+    reply_to_id = message.reply_to_message.message_id if message.reply_to_message else 0
+    if (
+        isinstance(recent_fingerprints, RecentMessageFingerprints)
+        and not recent_fingerprints.accept(
+            chat.id,
+            sender_id,
+            reply_to_id,
+            message_body(message),
+        )
+    ):
+        LOGGER.info(
+            "Ignoring duplicate Telegram message content: chat=%s user=%s message=%s",
+            chat.id,
+            sender_id,
+            message.message_id,
+        )
+        return
     if message.media_group_id and telegram_attachment(message):
         groups: dict[tuple[int, str], list[Message]] = context.application.bot_data.setdefault(
             "media_groups", {}
@@ -4568,6 +4623,7 @@ def build_application(settings: Settings) -> Application:
         settings.max_concurrent_requests
     )
     application.bot_data["recent_message_ids"] = RecentMessageIds()
+    application.bot_data["recent_message_fingerprints"] = RecentMessageFingerprints()
     application.bot_data["started_at"] = datetime.now(dt_timezone.utc)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
