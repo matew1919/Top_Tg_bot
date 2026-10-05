@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.matvei.top-tg-bot</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/matvei/PycharmProjects/Top_Tg_bot_hardening/.venv/bin/python</string>
+        <string>/Users/matvei/PycharmProjects/Top_Tg_bot_hardening/bot.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/matvei/PycharmProjects/Top_Tg_bot_hardening</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>BOT_ENV_FILE</key>
+        <string>/Users/matvei/PycharmProjects/Top_Tg_bot2/.env</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>BOT_LOG_CONSOLE</key>
+        <string>0</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/Users/matvei/PycharmProjects/Top_Tg_bot_hardening/runtime/launchd.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/matvei/PycharmProjects/Top_Tg_bot_hardening/runtime/launchd.stderr.log</string>
+</dict>
+</plist>

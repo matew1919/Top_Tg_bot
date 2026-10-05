@@ -4,3 +4,7 @@ openai>=1.0,<3
 python-dotenv>=1.0,<2
 tzdata>=2024.1
 ddgs>=9.14,<10
+httpx[socks]>=0.27,<1
+beautifulsoup4>=4.12,<5
+yt-dlp>=2026.7.4,<2027
+imageio-ffmpeg>=0.6,<1
