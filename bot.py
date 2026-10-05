@@ -22,7 +22,7 @@ from base64 import b64encode
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, TypeVar
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -31,6 +31,7 @@ from gigachat import GigaChat
 from openai import OpenAI
 from telegram import Message, Update
 from telegram.constants import ChatAction
+from telegram.error import BadRequest, NetworkError, RetryAfter
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
@@ -48,21 +49,45 @@ LOGGER = logging.getLogger(__name__)
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 MAX_TOOL_ROUNDS = 6
 BOT_INSTANCE_LOCK_PORT = 47653
-SAME_USER_CONTEXT_STREAK = 3
+TELEGRAM_REQUEST_POOL_SIZE = 16
+TELEGRAM_UPDATES_POOL_SIZE = 2
+TELEGRAM_SEND_ATTEMPTS = 3
+TELEGRAM_TYPING_DELAY_SECONDS = 0.75
+TELEGRAM_TYPING_INTERVAL_SECONDS = 4.0
+TELEGRAM_TYPING_REQUEST_TIMEOUT_SECONDS = 3.0
+TelegramResult = TypeVar("TelegramResult")
 DIALOGUE_SYSTEM_PROMPT = """Дополнительные правила естественного диалога:
 - Последнее сообщение пользователя — текущая задача. История и память ниже являются только фоном, а не поводом менять тему ответа.
 - Не упоминай факты из памяти, имя пользователя, учёбу, цели, интересы или старые темы, если они не помогают прямо ответить на последнее сообщение.
 - Подстраивай длину под сообщение: на короткую реакцию или бытовую реплику отвечай одной короткой фразой; на простой вопрос — обычно 1–3 предложениями; развёрнуто отвечай только по явной просьбе или когда без пояснения нельзя.
-- Не читай нотации, не мотивируй и не давай непрошеных советов. Не повторяй уже сказанное без необходимости.
+- Не повторяй уже сказанное без необходимости.
 - В групповом чате не приписывай одному участнику факты другого.
 - Пиши как участник живой переписки: сразу по сути, без обязательного обращения по имени, вступления и вывода."""
 TOOL_SYSTEM_PROMPT = """Дополнительные правила использования инструментов:
 - Используй create_reminder, когда пользователь просит поставить или создать напоминание. Передай в request полный исходный смысл запроса вместе со временем и текстом.
 - Используй web_search, когда для ответа нужны актуальные сведения из интернета или проверка факта, или например пользователь спрашивает что то, что могло изменится, например недавний фильм, или меняющийся факт.
+- Используй update_memory только когда пользователь явно сообщил новый устойчивый факт, предпочтение, долгосрочную цель или важную информацию о чате, которая с большой вероятностью пригодится в будущих разговорах. Не сохраняй шутки, догадки, разовые планы, текущие эмоции и обычную болтовню. Не вызывай инструмент, если факт уже есть в памяти.
 - Не утверждай, что инструмент сработал, пока не получил успешный результат.
 - После результата инструмента дай пользователю обычный естественный ответ. Не показывай служебный JSON и внутренние рассуждения.
 Текущее локальное время: {current_time}
 Часовой пояс пользователя: {timezone}"""
+
+
+@dataclass(frozen=True)
+class MediaAttachment:
+    """Ephemeral media sent only with the current model request."""
+
+    kind: str
+    mime_type: str
+    data: bytes
+
+    @property
+    def marker(self) -> str:
+        return "[отправлено фото]" if self.kind == "photo" else f"[отправлено {self.kind}]"
+
+    @property
+    def data_url(self) -> str:
+        return f"data:{self.mime_type};base64," + b64encode(self.data).decode("ascii")
 
 
 def load_runtime_config() -> dict[str, object]:
@@ -105,6 +130,8 @@ class Settings:
     soft_context_limit: int
     hard_context_limit: int
     keep_last_messages: int
+    group_context_limit: int
+    group_context_idle_seconds: int
     context_history_file: str
     memory_file: str
     memory_max_tokens: int
@@ -189,18 +216,24 @@ class Settings:
             soft_context_limit=max(2, integer("soft_context_limit", 8)),
             hard_context_limit=max(3, integer("hard_context_limit", 20)),
             keep_last_messages=max(1, integer("keep_last_messages", 2)),
+            group_context_limit=max(2, integer("group_context_limit", 5)),
+            group_context_idle_seconds=max(
+                60, integer("group_context_idle_seconds", 3600)
+            ),
             context_history_file=text("context_history_file", "context_history.json")
             or "context_history.json",
             memory_file=text("memory_file", "memory.json") or "memory.json",
             memory_max_tokens=max(64, integer("memory_max_tokens", 150)),
             memory_prompt=text(
                 "memory_prompt",
-                "Изучи CURRENT MEMORY и FULL CONVERSATION HISTORY. Верни полную "
-                "обновлённую память по чату и всем пользователям. Сохрани все факты "
-                "из текущей памяти. Добавь новые факты. Не удаляй факт, если он не "
-                "упомянут в истории. Блоки SHARED CHAT MEMORIES справочные и не "
-                "смешиваются с текущим чатом. Верни только строки CHAT_FACT: факт или "
-                "USER_FACT: user_id|name|факт. Если фактов нет, верни EMPTY.",
+                "Перепиши всю изменяемую память текущего чата с учётом CURRENT MEMORY "
+                "и NEW INFORMATION или FULL CONVERSATION HISTORY. Верни полный новый "
+                "набор mutable-фактов, а не только добавления. Сохрани актуальные факты, "
+                "объедини повторы и замени явно устаревшие сведения. IMMUTABLE-факты "
+                "защищены: не изменяй и не дублируй их в ответе. Блоки SHARED CHAT "
+                "MEMORIES справочные и не смешиваются с текущим чатом. Верни только "
+                "строки CHAT_FACT: факт или USER_FACT: user_id|name|факт. Если "
+                "mutable-фактов нет, верни EMPTY.",
             ),
             max_english_history_messages=max(1, integer("max_english_history_messages", 1)),
             reminders_file=text("reminders_file", "reminders.json") or "reminders.json",
@@ -237,13 +270,15 @@ def contains_english(text: str) -> bool:
 def mentioned_bot(message: Message, bot_username: str | None) -> bool:
     """Detect both @username mentions and Telegram text mentions."""
 
-    if not message.text or not bot_username:
+    text = message.text or message.caption or ""
+    entities = message.entities if message.text else message.caption_entities
+    if not text or not bot_username:
         return False
 
     username = bot_username.lower().lstrip("@")
-    for entity in message.entities or ():
+    for entity in entities or ():
         if entity.type == "mention":
-            mention = message.text[entity.offset : entity.offset + entity.length]
+            mention = text[entity.offset : entity.offset + entity.length]
             if mention.lower().lstrip("@").split("@")[0] == username:
                 return True
         elif entity.type == "text_mention" and message.from_user:
@@ -252,13 +287,120 @@ def mentioned_bot(message: Message, bot_username: str | None) -> bool:
             # the handler where the current bot id is available instead.
             continue
 
-    return bool(re.search(rf"(?<!\w)@{re.escape(username)}(?!\w)", message.text, re.I))
+    return bool(re.search(rf"(?<!\w)@{re.escape(username)}(?!\w)", text, re.I))
+
+
+def message_mentions_bot(
+    message: Message,
+    bot_username: str | None,
+    bot_id: int,
+) -> bool:
+    if mentioned_bot(message, bot_username):
+        return True
+    entities = message.entities if message.text else message.caption_entities
+    return any(
+        entity.type == "text_mention"
+        and entity.user
+        and entity.user.id == bot_id
+        for entity in entities or ()
+    )
 
 
 def remove_bot_mention(text: str, bot_username: str | None) -> str:
     if not bot_username:
         return text.strip()
     return re.sub(rf"(?<!\w)@{re.escape(bot_username.lstrip('@'))}(?!\w)", "", text, flags=re.I).strip()
+
+
+def clean_assistant_call(text: str, bot_username: str | None) -> str:
+    """Remove Telegram activation syntax before storing or sending user text."""
+
+    cleaned = remove_bot_mention(text, bot_username)
+    cleaned = re.sub(r"^\s*\?\?\s*", "", cleaned)
+    cleaned = re.sub(
+        r"^\s*/analyze(?:@[A-Za-z0-9_]+)?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return cleaned.strip()
+
+
+def telegram_media_marker(message: Message) -> str | None:
+    if message.photo or (
+        message.document and str(message.document.mime_type or "").startswith("image/")
+    ):
+        return "[отправлено фото]"
+    if message.video:
+        return "[отправлено видео]"
+    if message.animation:
+        return "[отправлена анимация]"
+    if message.voice:
+        return "[отправлено голосовое сообщение]"
+    if message.audio:
+        return "[отправлено аудио]"
+    if message.document:
+        return "[отправлен файл]"
+    if message.sticker:
+        return "[отправлен стикер]"
+    return None
+
+
+def quoted_message_block(message: Message) -> str:
+    """Represent a replied-to Telegram message without persisting its media."""
+
+    marker = telegram_media_marker(message)
+    body = message.text or message.caption or ""
+    parts: list[str] = []
+    if marker:
+        parts.append(marker)
+        if body.strip():
+            parts.append("Подпись: " + body.strip())
+    elif body.strip():
+        parts.append(body.strip())
+    else:
+        parts.append("[сообщение без текста]")
+    sender = message.from_user
+    sender_name = (
+        sender.full_name or sender.username or str(sender.id)
+        if sender
+        else "неизвестный отправитель"
+    )
+    return f"Сообщение от {sender_name}, на которое отвечает пользователь:\n" + "\n".join(parts)
+
+
+def direct_media_history_text(
+    message: Message,
+    bot_username: str | None,
+) -> str:
+    marker = telegram_media_marker(message) or "[отправлен медиафайл]"
+    caption = clean_assistant_call(message.caption or "", bot_username)
+    return marker + ("\nПодпись: " + caption if caption else "")
+
+
+def with_quoted_message(current_text: str, replied_to: Message) -> str:
+    quoted = quoted_message_block(replied_to)
+    return quoted + ("\n\nТекущий вопрос пользователя:\n" + current_text if current_text else "")
+
+
+def image_file_reference(message: Message) -> tuple[str, str] | None:
+    """Return a Telegram file id and MIME type for supported image messages."""
+
+    if message.photo:
+        return message.photo[-1].file_id, "image/jpeg"
+    if message.document and str(message.document.mime_type or "").startswith("image/"):
+        return message.document.file_id, str(message.document.mime_type)
+    return None
+
+
+async def download_image_attachment(message: Message, bot: object) -> MediaAttachment | None:
+    reference = image_file_reference(message)
+    if reference is None:
+        return None
+    file_id, mime_type = reference
+    telegram_file = await bot.get_file(file_id)
+    image_bytes = bytes(await telegram_file.download_as_bytearray())
+    return MediaAttachment(kind="photo", mime_type=mime_type, data=image_bytes)
 
 
 def question_trigger(text: str) -> bool:
@@ -298,15 +440,20 @@ def timezone_now(timezone_name: str) -> datetime:
 
 
 async def _typing_loop(bot: object, chat_id: int) -> None:
-    """Keep Telegram's typing indicator visible during a slow API request."""
+    """Keep typing visible without monopolizing an outbound connection."""
 
     try:
+        # Fast replies do not need a Telegram request just for the typing indicator.
+        await asyncio.sleep(TELEGRAM_TYPING_DELAY_SECONDS)
         while True:
             try:
-                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                await asyncio.wait_for(
+                    bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING),
+                    timeout=TELEGRAM_TYPING_REQUEST_TIMEOUT_SECONDS,
+                )
             except Exception:
                 LOGGER.debug("Could not send typing status", exc_info=True)
-            await asyncio.sleep(4)
+            await asyncio.sleep(TELEGRAM_TYPING_INTERVAL_SECONDS)
     except asyncio.CancelledError:
         raise
 
@@ -321,6 +468,55 @@ async def run_with_typing(bot: object, chat_id: int, operation):
             await typing_task
         except asyncio.CancelledError:
             pass
+
+
+def _retry_after_seconds(error: RetryAfter) -> float:
+    value = error.retry_after
+    if isinstance(value, timedelta):
+        return max(0.0, value.total_seconds())
+    return max(0.0, float(value))
+
+
+async def telegram_request_with_retry(
+    request_factory: Callable[[], Awaitable[TelegramResult]],
+    operation_name: str,
+) -> TelegramResult:
+    """Retry outbound Telegram calls that fail because of network or pool pressure."""
+
+    for attempt in range(1, TELEGRAM_SEND_ATTEMPTS + 1):
+        last_error: Exception | None = None
+        try:
+            return await request_factory()
+        except RetryAfter as error:
+            if attempt >= TELEGRAM_SEND_ATTEMPTS:
+                raise
+            last_error = error
+            delay = _retry_after_seconds(error) + 0.1
+        except NetworkError as error:
+            if isinstance(error, BadRequest):
+                raise
+            if attempt >= TELEGRAM_SEND_ATTEMPTS:
+                raise
+            last_error = error
+            delay = min(4.0, 0.5 * (2 ** (attempt - 1)))
+        LOGGER.warning(
+            "Telegram %s failed (%s/%s): %s; retrying in %.2fs",
+            operation_name,
+            attempt,
+            TELEGRAM_SEND_ATTEMPTS,
+            last_error,
+            delay,
+        )
+        await asyncio.sleep(delay)
+
+    raise RuntimeError("Telegram retry loop ended unexpectedly")
+
+
+async def reply_text_with_retry(message: Message, text: str) -> Message:
+    return await telegram_request_with_retry(
+        lambda: message.reply_text(text),
+        "reply",
+    )
 
 
 class ApiJournal:
@@ -442,6 +638,8 @@ class ContextHistoryStore:
                 if role not in {"user", "assistant"} or not isinstance(content, str):
                     continue
                 restored: dict[str, object] = {"role": role, "content": content}
+                if isinstance(message.get("created_at"), str):
+                    restored["created_at"] = message["created_at"]
                 if role == "user":
                     if isinstance(message.get("user_id"), int):
                         restored["user_id"] = message["user_id"]
@@ -846,7 +1044,7 @@ class MemoryStore:
         return "\n".join(lines) if lines else "EMPTY"
 
     def rewrite_from_extracted(self, chat_id: int, extracted: dict[str, object]) -> None:
-        """Rewrite model-managed memory while preserving facts omitted by the model."""
+        """Replace all model-managed facts while preserving protected facts and names."""
 
         chats = self.data.setdefault("chats", {})
         users = self.data.setdefault("users", {})
@@ -855,11 +1053,8 @@ class MemoryStore:
             self._normalize_scope(chat)
             mutable_chat = chat["mutable"]
             if isinstance(mutable_chat, dict):
-                old_facts = self._facts(chat, "mutable")
-                new_facts = extracted.get("chat_facts", [])
                 mutable_chat["facts"] = []
-                self._add_facts(mutable_chat, old_facts)
-                self._add_facts(mutable_chat, new_facts)
+                self._add_facts(mutable_chat, extracted.get("chat_facts", []))
 
         chat_users = users.setdefault(str(chat_id), {})
         extracted_users = extracted.get("users", {})
@@ -867,12 +1062,12 @@ class MemoryStore:
             self._save()
             return
 
-        # Existing users and their facts remain even if the model omitted them.
+        # The model returns the complete new mutable state. Omitted mutable
+        # facts are intentionally removed; names and immutable facts remain.
         for stored_user_id, user in list(chat_users.items()):
             if not isinstance(user, dict):
                 continue
             self._normalize_scope(user)
-            old_facts = self._facts(user, "mutable")
             info = extracted_users.get(str(stored_user_id), {})
             if not isinstance(info, dict):
                 info = {}
@@ -881,7 +1076,6 @@ class MemoryStore:
             mutable_user = user["mutable"]
             if isinstance(mutable_user, dict):
                 mutable_user["facts"] = []
-                self._add_facts(mutable_user, old_facts)
                 self._add_facts(mutable_user, info.get("facts"))
 
         for extracted_id, info in extracted_users.items():
@@ -1143,6 +1337,7 @@ class ReplyService:
         register_builtin_tools(
             self.tools,
             self._create_reminder_tool,
+            self._update_memory_tool,
             search_proxy=settings.telegram_proxy_url,
         )
 
@@ -1293,11 +1488,44 @@ class ReplyService:
             "timezone": context.timezone,
         }
 
+    async def _update_memory_tool(
+        self,
+        arguments: dict[str, object],
+        context: ToolContext,
+    ) -> dict[str, object]:
+        """Let the main model explicitly request a full mutable-memory rewrite."""
+
+        new_information = str(arguments.get("new_information") or "").strip()
+        scope = str(arguments.get("scope") or "").strip()
+        if not new_information:
+            return {"ok": False, "error": "Не указана новая информация для памяти."}
+        if scope not in {"current_user", "chat"}:
+            return {"ok": False, "error": "Неизвестная область памяти."}
+
+        if scope == "current_user":
+            memory_input = (
+                f"Сведения относятся к текущему пользователю: "
+                f"ID {context.user_id}, имя {context.user_name}.\n{new_information}"
+            )
+        else:
+            memory_input = "Сведения относятся к текущему чату в целом.\n" + new_information
+
+        updated = await self._extract_memory(
+            context.chat_id,
+            [],
+            new_information=memory_input,
+        )
+        if not updated:
+            return {"ok": False, "error": "Не удалось обновить долговременную память."}
+        return {"ok": True, "message": "Долговременная память полностью обновлена."}
+
     async def _vsegpt_reply_with_tools(
         self,
         request_messages: list[dict[str, object]],
         context: ToolContext,
         status_callback: Callable[[str], Awaitable[None]] | None = None,
+        *,
+        model: str | None = None,
     ) -> str:
         """Run native function calling until the model returns a text answer."""
 
@@ -1318,7 +1546,7 @@ class ReplyService:
                 *conversation,
             ]
             response = await self._vsegpt_chat(
-                model=self.settings.vsegpt_model,
+                model=model or self.settings.vsegpt_model,
                 messages=messages,
                 tools=self.tools.schemas,
                 tool_choice="auto",
@@ -1397,7 +1625,8 @@ class ReplyService:
         messages: list[dict[str, object]],
         current_user_id: int,
         mode: str,
-    ) -> list[dict[str, str]]:
+        is_private_chat: bool,
+    ) -> list[dict[str, object]]:
         def format_message(message: dict[str, object]) -> str:
             content = str(message["content"])
             if message.get("role") != "user":
@@ -1406,37 +1635,17 @@ class ReplyService:
             name = name.replace('"', "'").strip() or "пользователь"
             return f'Пишет "{name}":\n{content}'
 
+        del current_user_id
         selected = list(messages)
-        user_messages = [item for item in selected if item.get("role") == "user"]
-        if (
-            mode == "general"
-            and len(user_messages) >= SAME_USER_CONTEXT_STREAK
-            and all(
-                item.get("user_id") == current_user_id
-                for item in user_messages[-SAME_USER_CONTEXT_STREAK:]
-            )
-        ):
-            same_user_thread: list[dict[str, object]] = []
-            include_following_assistant = False
-            for item in selected:
-                if item.get("role") == "user":
-                    include_following_assistant = item.get("user_id") == current_user_id
-                    if include_following_assistant:
-                        same_user_thread.append(item)
-                elif include_following_assistant:
-                    same_user_thread.append(item)
-            selected = same_user_thread
-
         history_limit = (
             self.settings.max_english_history_messages
             if mode == "english_coach"
-            else self.settings.soft_context_limit
+            else (
+                self.settings.soft_context_limit
+                if is_private_chat
+                else self.settings.group_context_limit
+            )
         )
-        latest_user_text = str(user_messages[-1].get("content") or "") if user_messages else ""
-        if mode == "general" and self._is_lightweight_message(latest_user_text):
-            # Keep the immediately preceding exchange so a reaction such as
-            # "кайф" still has meaning, but do not drag in an older topic chain.
-            history_limit = min(history_limit, 3)
         selected = selected[-history_limit:]
         # A detached assistant reply has no useful meaning after the leading
         # user message was trimmed from the context window.
@@ -1448,19 +1657,85 @@ class ReplyService:
         ]
 
     @staticmethod
-    def _is_lightweight_message(text: str) -> bool:
-        """Short acknowledgements should not receive a full personal profile."""
+    def _history_now() -> datetime:
+        return datetime.now(dt_timezone.utc)
 
-        clean = re.sub(r"^\s*\?\?\s*", "", text).strip().lower()
-        clean = re.sub(r"[^0-9a-zа-яё]+", " ", clean).strip()
-        if not clean:
-            return True
-        lightweight = {
-            "ага", "ахах", "ахаха", "база", "да", "жесть", "кайф", "класс",
-            "круто", "ладно", "лол", "неплохо", "нет", "норм", "ок", "понял",
-            "понятно", "прикольно", "спасибо", "спасибо большое", "ясно",
-        }
-        return clean in lightweight
+    @staticmethod
+    def _parse_history_time(value: object) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt_timezone.utc)
+        return parsed.astimezone(dt_timezone.utc)
+
+    @staticmethod
+    def _last_complete_exchange(
+        messages: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """Return the last user/assistant pair, ignoring incomplete older turns."""
+
+        assistant_index = next(
+            (
+                index
+                for index in range(len(messages) - 1, -1, -1)
+                if messages[index].get("role") == "assistant"
+            ),
+            None,
+        )
+        if assistant_index is None:
+            return []
+        user_index = next(
+            (
+                index
+                for index in range(assistant_index - 1, -1, -1)
+                if messages[index].get("role") == "user"
+            ),
+            None,
+        )
+        if user_index is None:
+            return []
+        return [messages[user_index], messages[assistant_index]]
+
+    @staticmethod
+    def _trim_coherent_history(
+        messages: list[dict[str, object]], limit: int
+    ) -> None:
+        messages[:] = messages[-max(1, limit) :]
+        while messages and messages[0].get("role") == "assistant":
+            messages.pop(0)
+
+    def _reset_idle_group_history(
+        self,
+        messages: list[dict[str, object]],
+        now: datetime,
+    ) -> None:
+        last_assistant = next(
+            (
+                item
+                for item in reversed(messages)
+                if item.get("role") == "assistant"
+            ),
+            None,
+        )
+        if last_assistant is None:
+            return
+        last_reply_at = self._parse_history_time(last_assistant.get("created_at"))
+        idle_seconds = (
+            float("inf")
+            if last_reply_at is None
+            else max(0.0, (now - last_reply_at).total_seconds())
+        )
+        if idle_seconds <= self.settings.group_context_idle_seconds:
+            return
+        messages[:] = self._last_complete_exchange(messages)
+        LOGGER.info(
+            "Group context reduced to the last exchange after %.0f idle seconds",
+            idle_seconds,
+        )
 
     def _general_system_message(self, chat_id: int, user_id: int) -> str:
         """Keep durable behavior first and attach memory as clearly marked data."""
@@ -1526,13 +1801,16 @@ class ReplyService:
         self,
         chat_id: int,
         messages: list[dict[str, object]],
+        *,
+        new_information: str | None = None,
     ) -> bool:
-        if not messages:
+        if not messages and not new_information:
             return True
         LOGGER.info(
-            "Rewriting memory for chat %s from full context (%s messages)",
+            "Rewriting memory for chat %s (%s context messages, explicit=%s)",
             chat_id,
             len(messages),
+            bool(new_information),
         )
         transcript_parts: list[str] = []
         for item in messages:
@@ -1548,16 +1826,16 @@ class ReplyService:
         memory_snapshot = self.memory.memory_snapshot(chat_id)
         extractor_system = self.settings.memory_prompt
         try:
+            source_sections: list[str] = ["CURRENT MEMORY:\n" + memory_snapshot]
+            if transcript:
+                source_sections.append("FULL CONVERSATION HISTORY:\n" + transcript)
+            if new_information:
+                source_sections.append("NEW INFORMATION:\n" + new_information)
             request = [
                 {"role": "system", "content": extractor_system},
                 {
                     "role": "user",
-                    "content": (
-                        "CURRENT MEMORY:\n"
-                        + memory_snapshot
-                        + "\n\nFULL CONVERSATION HISTORY:\n"
-                        + transcript
-                    ),
+                    "content": "\n\n".join(source_sections),
                 },
             ]
             if self.settings.ai_provider == "gigachat":
@@ -1604,19 +1882,38 @@ class ReplyService:
         user_name: str,
         text: str,
         mode: str,
+        is_private_chat: bool,
     ) -> list[dict[str, object]]:
         messages = self.history.setdefault((chat_id, mode), [])
-        history_limit = (
-            self.settings.max_english_history_messages
-            if mode == "english_coach"
-            else self.settings.soft_context_limit
-        )
+        now = self._history_now()
+        timestamp = now.isoformat(timespec="seconds")
+        if not is_private_chat:
+            self._reset_idle_group_history(messages, now)
         messages.append(
-            {"role": "user", "content": text, "user_id": user_id, "user_name": user_name}
+            {
+                "role": "user",
+                "content": text,
+                "user_id": user_id,
+                "user_name": user_name,
+                "created_at": timestamp,
+            }
         )
+        if not is_private_chat:
+            history_limit = (
+                self.settings.max_english_history_messages
+                if mode == "english_coach"
+                else self.settings.group_context_limit
+            )
+            self._trim_coherent_history(messages, history_limit)
+            self.compacted_history.discard((chat_id, mode))
+            self._save_history()
+            return messages
+
         self._save_history()
         if mode == "english_coach":
-            messages[:] = messages[-history_limit:]
+            self._trim_coherent_history(
+                messages, self.settings.max_english_history_messages
+            )
             self._save_history()
             return messages
 
@@ -1678,6 +1975,7 @@ class ReplyService:
         mode: str,
         chat_type: str | None = None,
         tool_status_callback: Callable[[str], Awaitable[None]] | None = None,
+        media: MediaAttachment | None = None,
     ) -> str:
         if self.settings.ai_provider == "gigachat" and not self.gigachat_client:
             return (
@@ -1694,7 +1992,15 @@ class ReplyService:
         self.memory.remember_user(chat_id, user_id, user_name, chat_type)
         configured_name = self.memory.user_name(chat_id, user_id)
         speaker_name = configured_name or str(user_id)
-        messages = await self._prepare_history(chat_id, user_id, speaker_name, text, mode)
+        is_private_chat = chat_type == "private" or self.memory.is_private_chat(chat_id)
+        messages = await self._prepare_history(
+            chat_id,
+            user_id,
+            speaker_name,
+            text,
+            mode,
+            is_private_chat,
+        )
 
         try:
             system_message = (
@@ -1702,12 +2008,31 @@ class ReplyService:
                 if mode == "english_coach"
                 else self._general_system_message(chat_id, user_id)
             )
+            if media:
+                system_message += "\n\n" + self.settings.vision_prompt
+            api_history = self._api_messages(
+                messages,
+                user_id,
+                mode,
+                is_private_chat,
+            )
+            if media:
+                for item in reversed(api_history):
+                    if item.get("role") != "user":
+                        continue
+                    item["content"] = [
+                        {"type": "text", "text": str(item.get("content") or media.marker)},
+                        {"type": "image_url", "image_url": media.data_url},
+                    ]
+                    break
             request_messages = [
                 {"role": "system", "content": system_message},
-                *self._api_messages(messages, user_id, mode),
+                *api_history,
             ]
 
             if self.settings.ai_provider == "gigachat":
+                if media:
+                    raise RuntimeError("GigaChat media requests are not configured")
                 response = await self._gigachat_chat(
                     request_messages,
                     kind="reply",
@@ -1728,6 +2053,7 @@ class ReplyService:
                             timezone=self.settings.timezone,
                         ),
                         status_callback=tool_status_callback,
+                        model=(self.settings.vsegpt_vision_model if media else None),
                     )
                 else:
                     response = await self._vsegpt_chat(
@@ -1745,9 +2071,24 @@ class ReplyService:
             answer = "Не смог обработать сообщение. Попробуйте ещё раз позже."
 
         if answer:
-            messages.append({"role": "assistant", "content": answer})
-            if mode == "english_coach":
-                messages[:] = messages[-self.settings.max_english_history_messages :]
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": answer,
+                    "created_at": self._history_now().isoformat(timespec="seconds"),
+                }
+            )
+            if not is_private_chat:
+                history_limit = (
+                    self.settings.max_english_history_messages
+                    if mode == "english_coach"
+                    else self.settings.group_context_limit
+                )
+                self._trim_coherent_history(messages, history_limit)
+            elif mode == "english_coach":
+                self._trim_coherent_history(
+                    messages, self.settings.max_english_history_messages
+                )
             self._save_history()
             return answer
         return "Модель вернула пустой ответ. Попробуйте ещё раз."
@@ -1929,9 +2270,12 @@ async def reminder_loop(application: Application) -> None:
                     )
                     if not generated:
                         raise RuntimeError("Reminder model returned an empty response")
-                    await application.bot.send_message(
-                        chat_id=int(reminder["chat_id"]),
-                        text=generated,
+                    await telegram_request_with_retry(
+                        lambda: application.bot.send_message(
+                            chat_id=int(reminder["chat_id"]),
+                            text=generated,
+                        ),
+                        "reminder delivery",
                     )
                     store.remove(reminder_id)
                     LOGGER.info("Reminder delivered: %s", reminder_id)
@@ -1960,20 +2304,25 @@ async def stop_background_tasks(application: Application) -> None:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
+    await reply_text_with_retry(
+        update.effective_message,
         "Привет! Упомяните меня через @, начните сообщение с ?? или отправьте "
-        "сообщение на английском языке — и я отвечу. Для анализа фото добавьте "
-        "подпись ?? ваш вопрос. Для напоминания используйте /н. Подробнее: /help"
+        "сообщение на английском языке — и я отвечу. В личном чате можно просто "
+        "отправить фото; в группе добавьте ?? или @ в подпись либо ответьте с "
+        "обращением на чужое фото. Для напоминания используйте /н. Подробнее: /help"
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
+    await reply_text_with_retry(
+        update.effective_message,
         "Возможности бота:\n"
         "@бот текст — обычный ответ в чате.\n"
         "?? текст — обычный режим без упоминания.\n"
         "Английский текст без обращения — проверка и исправление английского.\n"
-        "Фото с подписью ?? вопрос или /analyze вопрос — анализ изображения.\n"
+        "В личке фото можно отправить без подписи. В группе добавьте к фото ?? или @бот.\n"
+        "Можно ответить на уже отправленное фото через ?? или @бот — файл и вопрос "
+        "будут обработаны вместе.\n"
         "/н свободное описание времени и задачи — напоминание. Например: "
         "/н напомни завтра вечером купить продукты.\n"
         "/start — краткое описание.\n"
@@ -2000,7 +2349,7 @@ async def api_log_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     service: ReplyService = context.application.bot_data["reply_service"]
     if not service.journal.enabled:
-        await message.reply_text("Журнал API отключён в config.json.")
+        await reply_text_with_retry(message, "Журнал API отключён в config.json.")
         return
     try:
         limit = max(1, min(10, int(context.args[0]))) if context.args else 5
@@ -2008,7 +2357,7 @@ async def api_log_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         limit = 5
     entries = service.journal.recent(chat.id, limit)
     if not entries:
-        await message.reply_text("В журнале этого чата пока нет запросов к модели.")
+        await reply_text_with_retry(message, "В журнале этого чата пока нет запросов к модели.")
         return
 
     chunks: list[str] = []
@@ -2024,7 +2373,7 @@ async def api_log_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     text = "\n\n====================\n\n".join(chunks)
     while text:
         part, text = text[:3800], text[3800:]
-        await message.reply_text(part)
+        await reply_text_with_retry(message, part)
 
 
 async def handle_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2057,76 +2406,42 @@ async def handle_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         ),
     )
     if reminder is None:
-        await message.reply_text(
+        await reply_text_with_retry(
+            message,
             "Не смог понять время. Напиши, например: /н напомни завтра вечером купить продукты"
         )
         return
     due_at = datetime.fromisoformat(str(reminder["due_at"]))
-    await message.reply_text(
+    await reply_text_with_retry(
+        message,
         "Напоминание поставлено на "
         + due_at.strftime("%d.%m.%Y %H:%M")
         + "."
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def answer_with_service(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    history_text: str,
+    mode: str,
+    *,
+    media: MediaAttachment | None = None,
+) -> None:
+    """Send one model reply and clean up transient tool status messages."""
+
     message = update.effective_message
     chat = update.effective_chat
-    if not message or not message.text or not chat:
+    if not message or not chat:
         return
-    if message.from_user and message.from_user.is_bot:
-        return
-    bot = context.bot
-    is_reply_to_bot = bool(
-        message.reply_to_message
-        and message.reply_to_message.from_user
-        and message.reply_to_message.from_user.id == bot.id
-    )
-    is_private_chat = chat.type == "private"
-    if not is_private_chat and ends_with_period(message.text) and not is_reply_to_bot:
-        return
-    if contains_excluded_mention(message.text):
-        return
-
-    bot_username = bot.username
-    is_mentioned = mentioned_bot(message, bot_username)
-
-    # Also support Telegram's rich text_mention entity, which has no @text.
-    if not is_mentioned:
-        for entity in message.entities or ():
-            if entity.type == "text_mention" and entity.user and entity.user.id == bot.id:
-                is_mentioned = True
-                break
-
-    is_english = contains_english(message.text)
-    is_question_trigger = question_trigger(message.text)
-    if (
-        not is_private_chat
-        and not is_mentioned
-        and not is_reply_to_bot
-        and not is_question_trigger
-        and not is_english
-    ):
-        return
-
-    prompt = remove_bot_mention(message.text, bot_username)
-    if not prompt:
-        prompt = "Расскажи, чем ты можешь помочь."
-
     service: ReplyService = context.application.bot_data["reply_service"]
-    # Private chats always use the regular assistant; English coaching is group-only.
-    mode = (
-        "general"
-        if is_private_chat or is_mentioned or is_reply_to_bot or is_question_trigger
-        else "english_coach"
-    )
     sender = message.from_user
     user_id = sender.id if sender else 0
     user_name = (sender.full_name or sender.username or str(user_id)) if sender else "unknown"
     tool_status_messages: list[Message] = []
 
     async def send_tool_status(status_text: str) -> None:
-        status_message = await message.reply_text(status_text)
+        status_message = await reply_text_with_retry(message, status_text)
         tool_status_messages.append(status_message)
 
     answer = await run_with_typing(
@@ -2136,16 +2451,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             update.effective_chat.id,
             user_id,
             user_name,
-            prompt,
+            history_text,
             mode,
             update.effective_chat.type,
             tool_status_callback=send_tool_status,
+            media=media,
         ),
     )
-    await message.reply_text(answer)
+    await reply_text_with_retry(message, answer)
     for status_message in tool_status_messages:
         try:
-            await status_message.delete()
+            await telegram_request_with_retry(
+                status_message.delete,
+                "temporary status deletion",
+            )
         except Exception:
             LOGGER.warning(
                 "Could not delete tool status message %s",
@@ -2154,49 +2473,101 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
 
 
-def photo_analysis_prompt(caption: str) -> str | None:
-    match = re.match(r"^\s*(?:\?\?|/analyze(?:@[A-Za-z0-9_]+)?)\s*(.*)", caption, re.I)
-    if not match:
-        return None
-    return match.group(1).strip() or "Кратко опиши изображение."
-
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if not message or not message.photo or (message.from_user and message.from_user.is_bot):
+    chat = update.effective_chat
+    if not message or not message.text or not chat:
         return
+    if message.from_user and message.from_user.is_bot:
+        return
+    if contains_excluded_mention(message.text):
+        return
+
+    bot = context.bot
+    is_private_chat = chat.type == "private"
+    is_reply_to_bot = bool(
+        message.reply_to_message
+        and message.reply_to_message.from_user
+        and message.reply_to_message.from_user.id == bot.id
+    )
+    is_mentioned = message_mentions_bot(message, bot.username, bot.id)
+    is_question_trigger = question_trigger(message.text)
+    is_english = contains_english(message.text)
+    if (
+        not is_private_chat
+        and not is_mentioned
+        and not is_reply_to_bot
+        and not is_question_trigger
+        and not is_english
+    ):
+        return
+    if (
+        not is_private_chat
+        and ends_with_period(message.text)
+        and not is_reply_to_bot
+        and not is_mentioned
+        and not is_question_trigger
+    ):
+        return
+
+    mode = (
+        "general"
+        if is_private_chat or is_mentioned or is_reply_to_bot or is_question_trigger
+        else "english_coach"
+    )
+    prompt = clean_assistant_call(message.text, bot.username)
+    media: MediaAttachment | None = None
+    if mode == "general" and message.reply_to_message:
+        prompt = with_quoted_message(prompt, message.reply_to_message)
+        try:
+            media = await download_image_attachment(message.reply_to_message, bot)
+        except Exception:
+            LOGGER.exception("Could not download image from replied-to message")
+    elif not prompt:
+        prompt = "Расскажи, чем ты можешь помочь."
+
+    await answer_with_service(update, context, prompt, mode, media=media)
+
+
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat or (message.from_user and message.from_user.is_bot):
+        return
+    if image_file_reference(message) is None:
+        return
+
     caption = message.caption or ""
-    prompt = photo_analysis_prompt(caption)
-    if prompt is None:
+    is_private_chat = chat.type == "private"
+    is_mentioned = message_mentions_bot(message, context.bot.username, context.bot.id)
+    is_question_trigger = question_trigger(caption)
+    is_analyze_command = bool(
+        re.match(r"^\s*/analyze(?:@[A-Za-z0-9_]+)?(?:\s|$)", caption, re.I)
+    )
+    if not is_private_chat and not is_mentioned and not is_question_trigger and not is_analyze_command:
         return
 
     service: ReplyService = context.application.bot_data["reply_service"]
     if service.settings.ai_provider != "vsegpt":
-        await message.reply_text("Анализ изображений доступен при AI_PROVIDER=vsegpt.")
+        await reply_text_with_retry(
+            message,
+            "Анализ изображений доступен при AI_PROVIDER=vsegpt.",
+        )
+        return
+    try:
+        media = await download_image_attachment(message, context.bot)
+    except Exception:
+        LOGGER.exception("Could not download image from Telegram")
+        await reply_text_with_retry(
+            message,
+            "Не смог скачать изображение из Telegram. Попробуй ещё раз.",
+        )
+        return
+    if media is None:
         return
 
-    photo = message.photo[-1]
-    telegram_file = await context.bot.get_file(photo.file_id)
-    image_bytes = bytes(await telegram_file.download_as_bytearray())
-
-    sender = message.from_user
-    service.memory.set_chat_type(update.effective_chat.id, update.effective_chat.type)
-    speaker_name = (
-        service.memory.user_name(update.effective_chat.id, sender.id)
-        if sender
-        else None
-    ) or (str(sender.id) if sender else "пользователь")
-    answer = await run_with_typing(
-        context.bot,
-        update.effective_chat.id,
-        service.analyze_image(
-            image_bytes,
-            prompt,
-            speaker_name,
-            update.effective_chat.id,
-        ),
-    )
-    await message.reply_text(answer)
+    history_text = direct_media_history_text(message, context.bot.username)
+    await answer_with_service(update, context, history_text, "general", media=media)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2208,7 +2579,7 @@ def build_application(settings: Settings) -> Application:
         "connect_timeout": settings.telegram_timeout,
         "read_timeout": settings.telegram_timeout,
         "write_timeout": settings.telegram_timeout,
-        "pool_timeout": settings.telegram_timeout,
+        "pool_timeout": min(10.0, settings.telegram_timeout),
     }
     get_updates_options = {
         **request_options,
@@ -2222,8 +2593,18 @@ def build_application(settings: Settings) -> Application:
     application = (
         ApplicationBuilder()
         .token(settings.telegram_token)
-        .request(HTTPXRequest(**request_options))
-        .get_updates_request(HTTPXRequest(**get_updates_options))
+        .request(
+            HTTPXRequest(
+                connection_pool_size=TELEGRAM_REQUEST_POOL_SIZE,
+                **request_options,
+            )
+        )
+        .get_updates_request(
+            HTTPXRequest(
+                connection_pool_size=TELEGRAM_UPDATES_POOL_SIZE,
+                **get_updates_options,
+            )
+        )
         .post_init(start_background_tasks)
         .post_shutdown(stop_background_tasks)
         .build()
@@ -2231,7 +2612,9 @@ def build_application(settings: Settings) -> Application:
     reminder_store = ReminderStore(settings.reminders_file)
     application.bot_data["reminder_store"] = reminder_store
     application.bot_data["reply_service"] = ReplyService(settings, reminder_store)
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(
+        MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_media)
+    )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler(["log", "journal"], api_log_command))

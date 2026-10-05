@@ -132,6 +132,7 @@ async def web_search(
 def register_builtin_tools(
     registry: ToolRegistry,
     create_reminder: ToolHandler,
+    update_memory: ToolHandler,
     *,
     search_proxy: str | None = None,
 ) -> None:
@@ -187,4 +188,36 @@ def register_builtin_tools(
             "additionalProperties": False,
         },
         create_reminder,
+    )
+    registry.register(
+        "update_memory",
+        (
+            "Rewrite long-term memory when the conversation contains a stable fact, "
+            "preference, goal or chat-wide detail that will probably be useful in future "
+            "conversations. Do not call this for transient plans, jokes, guesses, ordinary "
+            "small talk or facts that are already present in memory."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "new_information": {
+                    "type": "string",
+                    "description": (
+                        "A concise, self-contained statement of the new durable information. "
+                        "Preserve who the information belongs to and do not add guesses."
+                    ),
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["current_user", "chat"],
+                    "description": (
+                        "Use current_user for a fact about the sender and chat for a fact "
+                        "about the group or conversation as a whole."
+                    ),
+                },
+            },
+            "required": ["new_information", "scope"],
+            "additionalProperties": False,
+        },
+        update_memory,
     )
