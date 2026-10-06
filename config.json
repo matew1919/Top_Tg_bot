@@ -57,7 +57,7 @@
   "media_max_turn_bytes": 25000000,
   "media_max_image_payload_bytes": 6000000,
   "media_max_concurrent_jobs": 2,
-  "mem0_enabled": false,
+  "mem0_enabled": true,
   "mem0_storage_dir": "runtime/mem0",
   "mem0_embedding_model": "emb-openai/text-embedding-3-small",
   "mem0_embedding_dimensions": 1536,
