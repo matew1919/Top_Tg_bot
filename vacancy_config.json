@@ -1,5 +1,5 @@
 {
-  "enabled": true,
+  "enabled": false,
   "sources": ["hh", "habr"],
   "keywords": ["python", "django", "backend", "rest api", "django rest framework", "drf"],
   "required_keywords": ["python"],

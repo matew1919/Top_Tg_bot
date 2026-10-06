@@ -46,7 +46,7 @@
   "request_rate_limit_window_seconds": 60,
   "max_concurrent_requests": 4,
   "search_proxy_url": "",
-  "vacancy_autostart": true,
+  "vacancy_autostart": false,
   "vacancy_config_file": "vacancy_config.json",
   "media_max_bytes": 19000000,
   "media_max_duration_seconds": 600,
@@ -56,5 +56,11 @@
   "media_max_files_per_turn": 6,
   "media_max_turn_bytes": 25000000,
   "media_max_image_payload_bytes": 6000000,
-  "media_max_concurrent_jobs": 2
+  "media_max_concurrent_jobs": 2,
+  "mem0_enabled": false,
+  "mem0_storage_dir": "runtime/mem0",
+  "mem0_embedding_model": "emb-openai/text-embedding-3-small",
+  "mem0_embedding_dimensions": 1536,
+  "mem0_search_limit": 5,
+  "mem0_search_timeout": 4
 }
