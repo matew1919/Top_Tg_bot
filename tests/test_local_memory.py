@@ -83,6 +83,28 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('Любит чай', recalled)
         self.assertIn('три участника', recalled)
 
+    async def test_personal_and_shared_search_uses_one_embedding_and_cache(self):
+        memory = self.backend()
+        await memory.import_json({'chats': {'-200': {'facts': ['Три участника']}},
+                                  'users': {'-200': {'1': {'facts': ['Любит чай']}}}})
+        before = self.calls.count('/v1/embeddings')
+        result = await memory.search('чай', -200, 1, 'general')
+        self.assertIn('Любит чай', result)
+        self.assertIn('Три участника', result)
+        self.assertEqual(before + 1, self.calls.count('/v1/embeddings'))
+        self.assertEqual(result, await memory.search('чай', -200, 1, 'general'))
+        self.assertEqual(before + 1, self.calls.count('/v1/embeddings'))
+
+    async def test_background_learning_waits_for_idle_without_blocking_search(self):
+        memory = self.backend()
+        memory.pacer.touch()
+        memory.remember('Люблю чай', 100, 1, 'User', 'general')
+        await asyncio.sleep(0)
+        self.assertEqual([], self.calls)
+        self.assertFalse(memory._background)
+        await memory.search('чай', 100, 1, 'general')
+        self.assertEqual(['/v1/embeddings'], self.calls)
+
     async def test_disabled_backend_creates_no_storage(self):
         with patch.dict(os.environ, {'MEM0_ENABLED':'false'}):
             memory = self.backend()

@@ -6,9 +6,11 @@ import logging
 import os
 import hashlib
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from runtime_storage import atomic_write_text
+from api_pacing import ApiPacer
 
 LOGGER = logging.getLogger(__name__)
 
@@ -28,6 +30,10 @@ class LocalMemory:
         self._executor = None
         self._writes: set[asyncio.Future] = set()
         self._closed = False
+        self.pacer = ApiPacer(float(config.get('vsegpt_min_request_interval', 1.1)))
+        self._background = False
+        self._busy = False
+        self._cache = {}
         if self.enabled and not self.api_key:
             LOGGER.warning('Mem0 needs MEM0_LLM_API_KEY or VSEGPT_API_KEY; using existing memory')
             self.enabled = False
@@ -70,6 +76,11 @@ class LocalMemory:
         # Bound network calls; all local database access is serialized on one worker.
         for component in (self._memory.llm, self._memory.embedding_model):
             component.client = component.client.with_options(timeout=12.0, max_retries=0)
+            for resource in (component.client.chat.completions, component.client.embeddings):
+                original = resource.create
+                def paced(*args, _operation=original, **kwargs):
+                    return self.pacer.run(_operation, *args, background=self._background, **kwargs)
+                resource.create = paced
         LOGGER.info('Mem0 local storage ready at %s', self.path)
         return self._memory
 
@@ -78,27 +89,46 @@ class LocalMemory:
             self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='mem0-local')
         return asyncio.get_running_loop().run_in_executor(self._executor, operation)
 
+    async def warmup(self):
+        if self.enabled:
+            try:
+                await self._submit(self._get_memory)
+            except Exception as error:
+                LOGGER.warning('Mem0 warmup unavailable (%s)', type(error).__name__)
+
     async def search(self, text: str, chat_id: int, user_id: int, mode: str) -> str:
         if not self.enabled or self._closed:
             return ''
+        key = (chat_id, user_id, mode, text.strip().lower())
+        cached = self._cache.get(key)
+        if cached and time.monotonic() - cached[0] < 120:
+            return cached[1]
+        # A timed-out worker or a queued write must never hold up the next reply.
+        if self._busy or self._background:
+            return ''
         def retrieve():
-            memory = self._get_memory()
-            result = memory.search(
-                query=text, filters={'user_id': self.scope(chat_id, user_id, mode)},
-                top_k=int(self.config.get('mem0_search_limit', 5)),
-            )
-            shared = memory.search(
-                query=text, filters={'user_id': self.scope(chat_id, 0, mode)},
-                top_k=2,
-            )
-            result['results'].extend(shared.get('results', []))
-            return result
+            try:
+                memory = self._get_memory()
+                vector = memory.embedding_model.embed(text, 'search')
+                hits = memory.vector_store.search(text, vector,
+                    top_k=int(self.config.get('mem0_search_limit', 5)),
+                    filters={'user_id': [self.scope(chat_id, user_id, mode),
+                                         self.scope(chat_id, 0, mode)]})
+                facts = [str(hit.payload.get('data', ''))[:800] for hit in hits
+                         if hit.score >= 0.1 and hit.payload.get('data')]
+                result = '\n'.join('- ' + fact for fact in facts)[:4000]
+                self._cache[key] = (time.monotonic(), result)
+                if len(self._cache) > 256:
+                    self._cache.pop(next(iter(self._cache)))
+                return result
+            finally:
+                self._busy = False
+        self._busy = True
         future = self._submit(retrieve)
+        # Consume failures even if the caller already returned on its time budget.
+        future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
         try:
-            result = await asyncio.wait_for(future, timeout=float(self.config.get('mem0_search_timeout', 4)))
-            hits = result.get('results', []) if isinstance(result, dict) else result
-            facts = [str(hit['memory'])[:800] for hit in hits if isinstance(hit, dict) and hit.get('memory')]
-            return '\n'.join('- ' + fact for fact in facts)[:4000]
+            return await asyncio.wait_for(asyncio.shield(future), timeout=float(self.config.get('mem0_search_timeout', 1.5)))
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -112,13 +142,22 @@ class LocalMemory:
             LOGGER.warning('Mem0 write queue full; transcript remains in local history')
             return
         def save():
-            self._get_memory().add(
-                [{'role': 'user', 'content': text}],
-                user_id=self.scope(chat_id, user_id, mode),
-                metadata={'chat_id': str(chat_id), 'telegram_user_id': str(user_id),
-                          'user_name': user_name, 'mode': mode},
-            )
-        future = self._submit(save)
+            self._background = True
+            try:
+                self._get_memory().add(
+                    [{'role': 'user', 'content': text}],
+                    user_id=self.scope(chat_id, user_id, mode),
+                    metadata={'chat_id': str(chat_id), 'telegram_user_id': str(user_id),
+                              'user_name': user_name, 'mode': mode},
+                )
+                self._cache.clear()
+            finally:
+                self._background = False
+        async def deferred_save():
+            while self.pacer.idle_delay() > 0:
+                await asyncio.sleep(self.pacer.idle_delay())
+            await self._submit(save)
+        future = asyncio.create_task(deferred_save())
         self._writes.add(future)
         def completed(done):
             self._writes.discard(done)
@@ -128,6 +167,12 @@ class LocalMemory:
 
     async def close(self) -> None:
         self._closed = True
+        # Pending messages are already stored in the JSON transcript. Do not wait
+        # through the idle delay during shutdown; active database work finishes first.
+        for future in self._writes:
+            future.cancel()
+        if self._writes:
+            await asyncio.gather(*tuple(self._writes), return_exceptions=True)
         if self._executor is None:
             return
         def close_storage():
@@ -184,4 +229,5 @@ class LocalMemory:
                 metadata = item.get('metadata') or {}
                 if str(metadata.get('telegram_user_id')) == str(user_id):
                     memory.delete(item['id'])
+            self._cache.clear()
         await self._submit(remove)

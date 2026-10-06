@@ -12,7 +12,7 @@
   "vsegpt_vision_model": "vis-google/gemini-3-flash-pre",
   "vsegpt_multimodal_model": "google/gemini-3.1-flash-lite",
   "vsegpt_transcription_model": "stt-openai/gpt-4o-mini-transcribe",
-  "vsegpt_min_request_interval": 2.05,
+  "vsegpt_min_request_interval": 1.1,
   "vision_prompt": "Reply briefly in Russian like in a messenger. Do not use Markdown.",
   "telegram_timeout": 30,
   "telegram_proxy_url": "",
@@ -62,5 +62,5 @@
   "mem0_embedding_model": "emb-openai/text-embedding-3-small",
   "mem0_embedding_dimensions": 1536,
   "mem0_search_limit": 5,
-  "mem0_search_timeout": 4
+  "mem0_search_timeout": 1.5
 }

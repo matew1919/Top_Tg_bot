@@ -1968,6 +1968,9 @@ class ReplyService:
     ) -> object:
         """Serialize calls for VseGPT's account-wide request-rate limit."""
 
+        semantic_memory = getattr(self, 'semantic_memory', None)
+        if semantic_memory is not None:
+            return await asyncio.to_thread(semantic_memory.pacer.run, operation, *args, **kwargs)
         async with self._vsegpt_request_lock:
             loop = asyncio.get_running_loop()
             wait_for = self.settings.vsegpt_min_request_interval - (
@@ -2825,6 +2828,9 @@ class ReplyService:
             )
 
         self.memory.set_chat_type(chat_id, chat_type)
+        semantic_memory = getattr(self, 'semantic_memory', None)
+        if semantic_memory is not None:
+            semantic_memory.pacer.touch()
         self.memory.remember_user(chat_id, user_id, user_name, chat_type)
         configured_name = self.memory.user_name(chat_id, user_id)
         speaker_name = configured_name or str(user_id)
@@ -3703,6 +3709,9 @@ async def start_background_tasks(application: Application) -> None:
     )
     service: ReplyService = application.bot_data["reply_service"]
     monitor: VacancyMonitor = application.bot_data["vacancy_monitor"]
+    semantic_memory = getattr(service, 'semantic_memory', None)
+    if semantic_memory is not None:
+        await semantic_memory.warmup()
     if service.settings.vacancy_autostart and monitor.settings.enabled:
         application.bot_data["vacancy_task"] = asyncio.create_task(
             supervise_background_task(
