@@ -17,3 +17,6 @@ happ_autostart.log
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Machine-local Mem0 databases and history
+runtime/mem0/

@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from bot import start_background_tasks, stop_background_tasks
+from bot import start_background_tasks, stop_background_tasks, vacancies_command
 
 
 class VacancyAutostartTests(unittest.IsolatedAsyncioTestCase):
@@ -57,6 +57,27 @@ class VacancyAutostartTests(unittest.IsolatedAsyncioTestCase):
             await start_background_tasks(application)
             self.assertNotIn("vacancy_task", application.bot_data)
             await stop_background_tasks(application)
+
+
+    async def test_disabled_parser_overrides_autostart(self) -> None:
+        application = SimpleNamespace(bot_data={"vacancy_service": SimpleNamespace(
+            settings=SimpleNamespace(vacancy_autostart=True, vacancy_enabled=False)
+        )})
+        async def idle_loop(_application):
+            await asyncio.Event().wait()
+        with patch("bot.reminder_loop", idle_loop):
+            await start_background_tasks(application)
+            self.assertNotIn("vacancy_task", application.bot_data)
+            await stop_background_tasks(application)
+
+    async def test_disabled_parser_blocks_manual_poll(self) -> None:
+        service = SimpleNamespace(settings=SimpleNamespace(vacancy_enabled=False), poll=AsyncMock())
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(effective_message=message, effective_chat=SimpleNamespace(id=1))
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"vacancy_service":service}), args=["check"])
+        await vacancies_command(update, context)
+        service.poll.assert_not_awaited()
+        message.reply_text.assert_awaited_once_with("Парсер вакансий отключён в настройках бота.")
 
 
 if __name__ == "__main__":
