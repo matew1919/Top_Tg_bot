@@ -20,3 +20,6 @@ happ_autostart.log
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Legacy vacancy state preserved locally after updating branches
+vacancies.json

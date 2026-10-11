@@ -111,3 +111,34 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
         memory.remember('Я люблю чай', 100, 1, 'Ильсур', 'general')
         self.assertEqual('', await memory.search('вопрос', 100, 1, 'general'))
         self.assertFalse(memory.path.exists())
+
+    async def test_owned_fact_list_delete_and_cache_invalidation(self):
+        from chat_features import MemoryControls
+        memory=self.backend()
+        memory.controls=MemoryControls(self.root/'controls.json')
+        await memory.put_fact(-200,1,'Любит чай')
+        await memory.put_fact(-200,2,'Любит кофе')
+        own=await memory.list_facts(1)
+        self.assertEqual(1,len(own))
+        self.assertEqual([],await memory.list_facts(3))
+        with self.assertRaises(ValueError):
+            await memory.erase_fact(2,own[0]['id'])
+        self.assertIn('Любит чай',await memory.search('чай',-200,1,'general'))
+        await memory.erase_fact(1,own[0]['id'])
+        self.assertNotIn('Любит чай',await memory.search('чай',-200,1,'general'))
+        self.assertEqual(1,len(await memory.list_facts(2)))
+        self.assertTrue(memory.controls.blocked(-200,1,'любит чай!'))
+        await memory.close()
+        restarted=self.backend()
+        restarted.controls=MemoryControls(self.root/'controls.json')
+        self.assertEqual([],await restarted.list_facts(1))
+
+    async def test_global_forget_cancels_delayed_write_and_preserves_other_user(self):
+        memory=self.backend()
+        await memory.put_fact(-200,2,'Чужой факт')
+        memory.pacer.touch()
+        memory.remember('Мой факт',-200,1,'A','general')
+        await memory.forget(1)
+        await asyncio.sleep(0)
+        self.assertEqual([],await memory.list_facts(1))
+        self.assertEqual(1,len(await memory.list_facts(2)))

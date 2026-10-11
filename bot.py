@@ -66,6 +66,12 @@ from media_processing import (
 )
 from runtime_storage import atomic_write_text, load_json_object, migrate_legacy_runtime_files
 from vacancy_monitor import VacancyMonitor, load_vacancy_monitor_settings
+from chat_features import MemoryControls, LegacyMemory, GroupTranscript
+from feature_handlers import (
+    memory_command as managed_memory_command,
+    forget_command as managed_forget_command,
+    remember_command, summary_command, record_group_message,
+)
 from local_memory import LocalMemory
 from vacancy_parser import format_vacancy
 from search_status import SearchStatus, StatusMessages
@@ -1128,6 +1134,9 @@ class MemoryStore:
             self._save()
 
     def _save(self) -> None:
+        controls = getattr(self, "controls", None)
+        if controls is not None:
+            LegacyMemory(self, controls).enforce()
         serialized = json.dumps(self.data, ensure_ascii=False, indent=2)
         with self._lock:
             atomic_write_text(self.path, serialized)
@@ -1873,6 +1882,9 @@ class ReplyService:
         self.history_store = ContextHistoryStore(settings.context_history_file)
         self.history, self.compacted_history = self.history_store.load()
         self.memory = MemoryStore(settings.memory_file)
+        self.memory_controls = MemoryControls(project_path("runtime/memory_controls.json"))
+        self.memory.controls = self.memory_controls
+        LegacyMemory(self.memory, self.memory_controls).enforce()
         self.semantic_memory = LocalMemory(load_runtime_config(), settings, Path(__file__).resolve().parent)
         self.journal = ApiJournal(
             settings.api_journal_file,
@@ -1880,6 +1892,7 @@ class ReplyService:
             settings.api_journal_enabled,
             settings.api_journal_include_content,
         )
+        self.semantic_memory.controls = self.memory_controls
         self.tools = ToolRegistry()
         self._vsegpt_request_lock = asyncio.Lock()
         self._vsegpt_last_request_at = 0.0
@@ -2580,6 +2593,13 @@ class ReplyService:
         transcript = "\n".join(transcript_parts)
         memory_snapshot = self.memory.memory_snapshot(chat_id)
         extractor_system = self.settings.memory_prompt
+        controls = getattr(self, "memory_controls", None)
+        if controls is not None:
+            excluded = {str(user_id): controls.excluded(chat_id, user_id)
+                        for user_id in self.memory.data.get("users", {}).get(str(chat_id), {})}
+            excluded = {key: facts for key, facts in excluded.items() if facts}
+            if excluded:
+                extractor_system += "\nThese obsolete facts were explicitly removed by their users. Do not restore them from old history: " + json.dumps(excluded, ensure_ascii=False)
         try:
             request = [
                 {"role": "system", "content": extractor_system},
@@ -3771,7 +3791,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/н напомни завтра вечером купить продукты.\n"
         "/reminders, /cancel ID, /snooze ID минуты — управление напоминаниями.\n"
         "/timezone Europe/Moscow — персональный часовой пояс.\n"
-        "/memory и /forget confirm — просмотр и удаление памяти.\n"
+        "/memory, /remember текст, /forget ID, /memory edit ID текст — управление памятью в личке.\n"
+        "/forget confirm — удалить всю свою память.\n"
+        "/summary [часы] — сводка группы, по умолчанию за 24 часа.\n"
         "/vacancies status|check|show|on|off — мониторинг вакансий (владелец).\n"
         "/status — состояние бота и фоновых задач (только владелец).\n"
         "/start — краткое описание.\n"
@@ -3868,45 +3890,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    chat = update.effective_chat
-    sender = update.effective_user
-    if not message or not chat or not sender:
-        return
-    if chat.type != "private":
-        await reply_text_with_retry(message, "Команда /memory доступна только в личном чате.")
-        return
-    service: ReplyService = context.application.bot_data["reply_service"]
-    memory_text = service.memory.personal_context(chat.id, sender.id).strip()
-    if not memory_text:
-        await reply_text_with_retry(message, "Сохранённой памяти о тебе пока нет.")
-        return
-    await reply_text_with_retry(
-        message,
-        "Сохранённая память:\n" + _journal_value(memory_text, limit=3400),
-    )
+    await managed_memory_command(update, context)
 
 
 async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    chat = update.effective_chat
-    sender = update.effective_user
-    if not message or not chat or not sender:
-        return
-    if chat.type != "private":
-        await reply_text_with_retry(message, "Команда /forget доступна только в личном чате.")
-        return
-    confirmation = context.args[0].lower() if context.args else ""
-    if confirmation != "confirm":
-        await reply_text_with_retry(
-            message,
-            "Команда удалит твою память и рабочий контекст во всех чатах. Для подтверждения: /forget confirm",
-        )
-        return
-    service: ReplyService = context.application.bot_data["reply_service"]
-    service.forget_user_data(sender.id, chat.id)
-    await service.semantic_memory.forget(sender.id)
-    await reply_text_with_retry(message, "Память и рабочий контекст о тебе удалены.")
+    await managed_forget_command(update, context)
 
 
 async def timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4652,6 +4640,15 @@ def build_application(settings: Settings) -> Application:
     application.bot_data["recent_message_ids"] = RecentMessageIds()
     application.bot_data["recent_message_fingerprints"] = RecentMessageFingerprints()
     application.bot_data["started_at"] = datetime.now(dt_timezone.utc)
+    application.bot_data["feature_reply"] = reply_text_with_retry
+    application.bot_data["feature_typing"] = run_with_typing
+    application.bot_data["group_transcript"] = GroupTranscript(project_path("runtime/group_transcript.sqlite3"))
+    application.add_handler(MessageHandler(
+        filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
+        record_group_message,
+    ), group=-1)
+    application.add_handler(CommandHandler("remember", remember_command))
+    application.add_handler(CommandHandler("summary", summary_command))
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status_command))
